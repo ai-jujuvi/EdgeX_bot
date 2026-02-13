@@ -11,6 +11,7 @@ from bot.grid_engine import GridEngine
 
 async def main() -> None:
     load_dotenv()
+
     # logs ディレクトリへファイル出力（全レベル）
     try:
         os.makedirs("logs", exist_ok=True)
@@ -28,6 +29,7 @@ async def main() -> None:
     except Exception:
         # ファイル出力に失敗しても実行は継続（標準出力は残す）
         pass
+
     # 設定ファイルは任意（無ければ空dict）
     try:
         with open("configs/edgex.yaml", "r", encoding="utf-8") as f:
@@ -49,6 +51,7 @@ async def main() -> None:
     contract_id_env = os.getenv("EDGEX_CONTRACT_ID")
     symbol_env = os.getenv("EDGEX_SYMBOL")
     symbol_cfg = cfg.get("symbol") or cfg.get("contract_id")
+
     # シンボル未指定ならBTC-PERPの既定ID（EdgeXの例: 10000001）
     symbol = contract_id_env or symbol_env or symbol_cfg or "10000001"
 
@@ -57,33 +60,54 @@ async def main() -> None:
         raise SystemExit("EDGEX_BASE_URL が不正です（https://ホスト名 を設定してください）")
     if parsed.hostname and "example" in parsed.hostname:
         raise SystemExit("EDGEX_BASE_URL がプレースホルダです。実際のAPIベースURLに置き換えてください。")
+
     logger.info("edgex base_url={}, symbol_param={}, symbol={}", base_url, symbol_param, symbol)
 
     # === GAS(Web)認証を強制: シートA列のIDに一致しなければ起動拒否 ===
     # auth_url は設定が無い場合、既定であなたのデプロイURLへ問い合わせます
-    import httpx  # type: ignore
-    default_auth_url = "https://script.google.com/macros/s/AKfycbz5qTzBD62-FRdRwA0qBzxPy6fGj3fuuRwx4fQ0cNj-qmLtWwOqo9UZDnc0tv31ezMl/exec"
-    auth_url = cfg.get("auth_url") or default_auth_url
-    try:
-        acct_str = str(api_id)
-        logger.info("認証チェック開始: url={} account_id={}", auth_url, acct_str)
-        params = {"accountId": acct_str}
-        timeout = httpx.Timeout(6.0)
-        async with httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"}, follow_redirects=True) as client:
-            r = await client.get(auth_url, params=params)
-            r.raise_for_status()
-            body = r.json()
-            allowed_raw = body.get("allowed") if isinstance(body, dict) else None
-            allowed = str(allowed_raw).lower() in ("1", "true", "yes")
-            if not allowed:
-                logger.error("認証されていないアカウントIDです: account_id={} / 認証してください: {}?accountId={}", acct_str, auth_url, acct_str)
-                raise SystemExit(f"認証NG: account_id={acct_str}")
-        logger.info("認証OK: account_id={}", acct_str)
-    except SystemExit:
-        raise
-    except Exception as e:
-        logger.warning("認証サーバへの接続/検証に失敗しました: {} / 認証してください: {}?accountId={}", e, auth_url, str(api_id))
-        raise SystemExit(f"認証サーバ接続失敗: {e}")
+    #
+    # === optional: skip GAS auth ===
+    if str(os.getenv("EDGEX_SKIP_AUTH", "0")).lower() in ("1", "true", "yes"):
+        logger.warning("EDGEX_SKIP_AUTH=1 のため、GAS認証をスキップします")
+    else:
+        import httpx  # type: ignore
+
+        default_auth_url = "https://script.google.com/macros/s/AKfycbz5qTzBD62-FRdRwA0qBzxPy6fGj3fuuRwx4fQ0cNj-qmLtWwOqo9UZDnc0tv31ezMl/exec"
+        auth_url = cfg.get("auth_url") or default_auth_url
+        try:
+            acct_str = str(api_id)
+            logger.info("認証チェック開始: url={} account_id={}", auth_url, acct_str)
+            params = {"accountId": acct_str}
+            timeout = httpx.Timeout(6.0)
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers={"Accept": "application/json"},
+                follow_redirects=True,
+            ) as client:
+                r = await client.get(auth_url, params=params)
+                r.raise_for_status()
+                body = r.json()
+                allowed_raw = body.get("allowed") if isinstance(body, dict) else None
+                allowed = str(allowed_raw).lower() in ("1", "true", "yes")
+                if not allowed:
+                    logger.error(
+                        "認証されていないアカウントIDです: account_id={} / 認証してください: {}?accountId={}",
+                        acct_str,
+                        auth_url,
+                        acct_str,
+                    )
+                    raise SystemExit(f"認証NG: account_id={acct_str}")
+            logger.info("認証OK: account_id={}", acct_str)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.warning(
+                "認証サーバへの接続/検証に失敗しました: {} / 認証してください: {}?accountId={}",
+                e,
+                auth_url,
+                str(api_id),
+            )
+            raise SystemExit(f"認証サーバ接続失敗: {e}")
 
     # ループ間隔は未指定なら2.5秒（稼働安定の既定値）
     poll_interval_raw = os.getenv("EDGEX_POLL_INTERVAL_SEC") or cfg.get("poll_interval_sec", 2.5)
@@ -91,6 +115,8 @@ async def main() -> None:
         poll_interval = float(poll_interval_raw)
     except Exception:
         poll_interval = 2.5
+
+    # 速すぎるとAPI制限に当たるので最低値を持たせる
     if poll_interval < 1.5:
         poll_interval = 1.5
 
@@ -98,6 +124,7 @@ async def main() -> None:
         raise SystemExit("EDGEX_STARK_PRIVATE_KEY (or EDGEX_L2_KEY) が未設定です")
     if not api_id:
         raise SystemExit("EDGEX_ACCOUNT_ID が未設定です")
+
     adapter = EdgeXSDKAdapter(
         base_url=base_url,
         account_id=int(api_id),
@@ -118,5 +145,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("stopped by user")
-
-
