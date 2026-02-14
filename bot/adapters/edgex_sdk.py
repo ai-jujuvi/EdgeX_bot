@@ -24,16 +24,6 @@ def _env_float(name: str, default: float | None = None) -> float | None:
         return default
 
 
-def _env_int(name: str, default: int | None = None) -> int | None:
-    s = _env_str(name, None)
-    if s is None:
-        return default
-    try:
-        return int(s)
-    except Exception:
-        return default
-
-
 def _truthy_env(name: str, default: bool = False) -> bool:
     v = _env_str(name, None)
     if v is None:
@@ -64,17 +54,16 @@ class EdgeXAdapter:
     ✅ ここが “実発注の入口”。
     → DRY_RUNは「二重ガード」で必ず止める（事故防止）。
 
-    置換ポイント：
-    - get_mid_price(): あなたの実装（best_bid/best_ask → mid）に差し替え
-    - _place_order_real(): あなたの実発注SDK呼び出しに差し替え
+    重要：あなたの既存コード（run_edgex_grid.py）が
+    `from bot.adapters.edgex_sdk import EdgeXSDKAdapter`
+    をしているので、下で互換クラス EdgeXSDKAdapter を用意してあります。
 
     環境変数（安全装置系：任意）
     - DRY_RUN=1                         : 最優先で実発注停止（強制）
-    - EDGEX_MIN_ORDER_SIZE              : 最小サイズ（例 BTC 0.003 / GOLD は後で設定）
+    - EDGEX_MIN_ORDER_SIZE              : 最小サイズ（例 BTC 0.003）
     - EDGEX_MAX_ORDER_SIZE              : 最大サイズ（暴走防止）
     - EDGEX_SIZE_STEP                   : サイズ刻み（例 0.001 など。未指定なら丸めしない）
     - EDGEX_PRICE_TICK                  : 価格刻み（例 GOLDが0.1刻み等。未指定なら丸めしない）
-    - EDGEX_MAX_LEVELS_PER_SIDE         : 片側levels上限（グリッド側で使う想定だが、ここでも守れる）
     - EDGEX_ADAPTER_OP_SPACING_SEC      : 注文間隔（レート制限/安全）
     """
 
@@ -87,6 +76,7 @@ class EdgeXAdapter:
         symbol: str,
         dry_run: bool,
         op_spacing_sec: float = 1.5,
+        **_kwargs,  # ← 既存コードが余分な引数を渡しても落ちないための保険
     ):
         self.base_url = str(base_url)
         self.account_id = str(account_id)
@@ -98,7 +88,6 @@ class EdgeXAdapter:
         self.dry_run = bool(dry_run)
 
         # ✅ もう片方：環境変数で“強制DRY_RUN”
-        # どっちかがTrueなら絶対に実発注しない
         self.force_dry_run = _truthy_env("DRY_RUN", default=True)
 
         # ✅ 安全装置（サイズ/刻み）
@@ -108,7 +97,8 @@ class EdgeXAdapter:
         self.price_tick = _env_float("EDGEX_PRICE_TICK", None)    # 例: 0.1
 
         # ✅ レート制限/安全
-        self.op_spacing_sec = max(0.2, float(_env_float("EDGEX_ADAPTER_OP_SPACING_SEC", op_spacing_sec) or op_spacing_sec))
+        env_spacing = _env_float("EDGEX_ADAPTER_OP_SPACING_SEC", None)
+        self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
         self._last_op_ts = 0.0
 
         # TODO: あなたの環境のSDK初期化に置き換える
@@ -144,29 +134,16 @@ class EdgeXAdapter:
         TODO: あなたの実装に置き換え（必須）
         - SDK/RESTで best_bid / best_ask を取って mid を返す
         - 価格が取れない時は None を返す（その場合、上位ロジックは停止する）
-
-        例：
-            ob = self.client.get_orderbook(self.contract_id)
-            best_bid = float(ob["best_bid"])
-            best_ask = float(ob["best_ask"])
-            return (best_bid + best_ask) / 2.0
         """
         return None
 
     def _round_to_step(self, value: float, step: float) -> float:
-        """
-        step刻みに丸める（安全のため“切り捨て”寄りにする）
-        """
         if step <= 0:
             return float(value)
-        # 切り捨て（過大発注を避ける）
-        n = int(value / step)
+        n = int(value / step)  # 切り捨て
         return float(n * step)
 
     def _validate_and_normalize(self, side: str, price: float, size: float) -> OrderIntent | None:
-        """
-        ✅ 事故防止：異常値はここで止める（None返して発注しない）
-        """
         side_u = str(side).upper().strip()
         if side_u not in ("BUY", "SELL"):
             log.error("Invalid side=%s (must be BUY/SELL). BLOCK.", side)
@@ -223,19 +200,11 @@ class EdgeXAdapter:
         )
 
     def _is_dry_run_effective(self) -> bool:
-        """
-        ✅ 二重ガード（どちらかがONなら絶対に実発注しない）
-        """
         return bool(self.dry_run) or bool(self.force_dry_run)
 
     def place_limit_order(self, side: str, price: float, size: float) -> None:
-        """
-        ✅ 事故ポイントなので、最優先で DRY_RUN を止める。
-        DRY_RUN時は、置くはずの注文をログに必ず出す。
-        """
         intent = self._validate_and_normalize(side=side, price=price, size=size)
         if intent is None:
-            # バリデーション落ち → 発注しない
             return
 
         self._rate_limit_sleep()
@@ -244,27 +213,23 @@ class EdgeXAdapter:
             log.info("[DRY_RUN] would place order: %s", intent.to_dict())
             return
 
-        # ✅ 実発注（ここだけがREAL PATH）
         self._place_order_real(intent)
+
+    # ✅ 既存コードが place_order(...) を呼んでいる可能性があるので互換メソッドも用意
+    def place_order(self, side: str, price: float, size: float) -> None:
+        self.place_limit_order(side=side, price=price, size=size)
 
     def _place_order_real(self, intent: OrderIntent) -> None:
         """
         TODO: ここをあなたの既存SDK呼び出しに置換してください（必須）
         """
-        # 例：
-        # res = self.client.place_order(
-        #     contract_id=int(intent.contract_id),
-        #     side=intent.side,
-        #     price=intent.price,
-        #     size=intent.size,
-        #     order_type="LIMIT",
-        # )
-        # log.info("placed: %s", res)
-
-        # テンプレのままなら危険なので、敢えてエラー寄りログにして気づけるようにする
         log.critical(
             "REAL ORDER PATH is NOT implemented. BLOCKED. intent=%s",
             intent.to_dict(),
         )
-        # 事故防止：未実装のままでも“勝手に通らない”ように例外で落とす
         raise RuntimeError("EdgeXAdapter._place_order_real is not implemented")
+
+
+# ✅ 互換：run_edgex_grid.py が import している名前を復活させる
+class EdgeXSDKAdapter(EdgeXAdapter):
+    pass
