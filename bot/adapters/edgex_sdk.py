@@ -1,59 +1,18 @@
 import os
 import time
 import logging
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 
-def _env_str(name: str, default: str | None = None) -> str | None:
+def _env(name, default=None):
     v = os.getenv(name)
-    if v is None:
-        return default
-    v = v.strip()
-    return v if v != "" else default
-
-
-def _env_float(name: str, default: float | None = None) -> float | None:
-    s = _env_str(name, None)
-    if s is None:
-        return default
-    try:
-        return float(s)
-    except Exception:
-        return default
-
-
-@dataclass(frozen=True)
-class OrderIntent:
-    symbol: str
-    contract_id: str
-    side: str
-    price: float
-    size: float
-
-    def to_dict(self) -> dict:
-        return {
-            "symbol": self.symbol,
-            "contract_id": self.contract_id,
-            "side": self.side,
-            "price": float(self.price),
-            "size": float(self.size),
-        }
+    return v.strip() if v else default
 
 
 class EdgeXAdapter:
-    """
-    Adapter must match grid_engine expectations.
-
-    Your ops rule:
-    - NO DRY_RUN in code.
-    - Stop/start controlled by Render Suspend.
-    - Safety during testing is achieved via EDGEX_MAKER_MODE=validate.
-    """
-
     def __init__(
         self,
         base_url: str,
@@ -61,279 +20,119 @@ class EdgeXAdapter:
         stark_private_key: str,
         contract_id: str,
         symbol: str,
-        op_spacing_sec: float = 1.5,
-        **_kwargs,
+        **kwargs,
     ):
-        self.base_url = str(base_url)
-        self.account_id = str(account_id)
-        self.stark_private_key = str(stark_private_key)
-        self.contract_id = str(contract_id)
-        self.symbol = str(symbol)
+        self.base_url = base_url
+        self.account_id = account_id
+        self.stark_private_key = stark_private_key
+        self.contract_id = contract_id
+        self.symbol = symbol
 
-        # spacing (avoid bursts)
-        env_spacing = _env_float("EDGEX_ADAPTER_OP_SPACING_SEC", None)
-        self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
-        self._last_op_ts = 0.0
+        self.maker_mode = _env("EDGEX_MAKER_MODE", "validate")
+        self.dummy_price = float(_env("EDGEX_DUMMY_TICKER_PRICE", 2000.0))
 
-        # validate/live
-        self.maker_mode = (_env_str("EDGEX_MAKER_MODE", "validate") or "validate").strip().lower()
+        log.info("Adapter ready. mode=%s", self.maker_mode)
 
-        # Optional rails
-        self.min_size = _env_float("EDGEX_MIN_ORDER_SIZE", None)
-        self.max_size = _env_float("EDGEX_MAX_ORDER_SIZE", None)
-        self.size_step = _env_float("EDGEX_SIZE_STEP", None)
-        self.price_tick = _env_float("EDGEX_PRICE_TICK", None)
-
-        # Temporary dummy ticker (until real API is wired)
-        self.dummy_ticker_price = float(_env_float("EDGEX_DUMMY_TICKER_PRICE", 2000.0) or 2000.0)
-
-        log.info(
-            "Adapter init: base_url=%s symbol=%s contract_id=%s maker_mode=%s "
-            "min_size=%s max_size=%s size_step=%s price_tick=%s op_spacing_sec=%.2f dummy_ticker_price=%s",
-            self.base_url,
-            self.symbol,
-            self.contract_id,
-            self.maker_mode,
-            self.min_size,
-            self.max_size,
-            self.size_step,
-            self.price_tick,
-            self.op_spacing_sec,
-            self.dummy_ticker_price,
-        )
-
-    # -------------------------
+    # -----------------------------
     # grid_engine compatibility
-    # -------------------------
-    async def connect(self) -> None:
-        log.info("Adapter connect(): OK (no-op).")
+    # -----------------------------
 
-    async def close(self) -> None:
-        log.info("Adapter close(): OK (no-op).")
+    async def connect(self):
+        log.info("connect OK")
+
+    async def close(self):
+        log.info("close OK")
 
     async def get_ticker(self, *args, **kwargs):
-        """
-        grid_engine expects an object with .price
-        """
-        p = float(self.dummy_ticker_price)
-        log.warning(
-            "get_ticker(): returning DUMMY ticker price=%s (args=%s kwargs=%s). "
-            "Set EDGEX_DUMMY_TICKER_PRICE to change.",
-            p,
-            args,
-            kwargs,
-        )
+        p = float(self.dummy_price)
         return SimpleNamespace(price=p, bid=p, ask=p, last=p)
 
-    def get_mid_price(self) -> float | None:
-        return float(self.dummy_ticker_price)
-
-    def list_active_orders(self, *args, **kwargs):
-        """
-        grid_engine may call this to check existing orders.
-        In validate mode (and for now), we return empty list.
-        """
-        if args or kwargs:
-            log.debug("list_active_orders(): args=%s kwargs=%s (returning empty)", args, kwargs)
+    async def list_active_orders(self, *args, **kwargs):
         return []
 
-    async def list_active_orders_async(self, *args, **kwargs):
-        return self.list_active_orders(*args, **kwargs)
+    async def cancel_order(self, *args, **kwargs):
+        return {"ok": True}
 
-    def cancel_order(self, *args, **kwargs) -> dict:
-        """
-        Optional cancel path.
-        """
-        if self.maker_mode in ("validate", "paper", "dry_run"):
-            log.info("[VALIDATE_MODE] would cancel order: args=%s kwargs=%s", args, kwargs)
-            return {"ok": True, "mode": "validate", "action": "cancel"}
-        log.warning("cancel_order(): live cancel not implemented. args=%s kwargs=%s", args, kwargs)
-        return {"ok": False, "reason": "cancel_not_implemented"}
+    # -----------------------------
+    # order extraction (robust)
+    # -----------------------------
 
-    async def cancel_order_async(self, *args, **kwargs) -> dict:
-        return self.cancel_order(*args, **kwargs)
+    def _normalize_side(self, side: Any) -> str:
+        if hasattr(side, "name"):
+            return side.name.upper()
+        s = str(side)
+        if "." in s:
+            s = s.split(".")[-1]
+        return s.upper()
 
-    # -------------------------
-    # internals
-    # -------------------------
-    def _rate_limit_sleep(self) -> None:
-        now = time.time()
-        dt = now - self._last_op_ts
-        if dt < self.op_spacing_sec:
-            time.sleep(self.op_spacing_sec - dt)
-        self._last_op_ts = time.time()
+    def _extract(self, *args, **kwargs):
 
-    def _round_floor(self, value: float, step: float) -> float:
-        if step <= 0:
-            return float(value)
-        n = int(value / step)  # floor
-        return float(n * step)
-
-    def _extract_side_price_size(self, *args, **kwargs) -> tuple[str, float, float]:
-        """
-        Accept both call styles:
-        - place_order(side, price, size)
-        - place_order(order_obj)  (order_obj may have side/price/size or fields inside)
-        """
-        # style A: explicit args
+        # explicit style
         if len(args) >= 3:
-            side = args[0]
-            price = args[1]
-            size = args[2]
-            return str(side), float(price), float(size)
+            return args[0], args[1], args[2]
 
-        # style B: single order object
-        if len(args) == 1 and not kwargs:
+        # object style
+        if len(args) == 1:
             o = args[0]
 
-            # Some engines pass enum-like side (OrderSide.BUY). Make it string.
-            def _as_str(x: Any) -> str:
-                if hasattr(x, "name"):
-                    return str(x.name)
-                return str(x)
-
-            # Try common shapes
+            # direct attrs
             if hasattr(o, "side") and hasattr(o, "price") and hasattr(o, "size"):
-                return _as_str(getattr(o, "side")), float(getattr(o, "price")), float(getattr(o, "size"))
+                return o.side, o.price, o.size
 
-            # Some pass dict-like
+            # dict
             if isinstance(o, dict):
-                return _as_str(o.get("side")), float(o.get("price")), float(o.get("size"))
+                return o.get("side"), o.get("price"), o.get("size")
 
-            # Some pass order with nested fields
-            for side_key in ("side", "order_side"):
-                for price_key in ("price", "limit_price"):
-                    for size_key in ("size", "qty", "amount"):
-                        if hasattr(o, side_key) and hasattr(o, price_key) and hasattr(o, size_key):
-                            return _as_str(getattr(o, side_key)), float(getattr(o, price_key)), float(getattr(o, size_key))
+            # nested common patterns
+            for s in ["side", "order_side"]:
+                for p in ["price", "limit_price"]:
+                    for z in ["size", "qty", "amount"]:
+                        if hasattr(o, s) and hasattr(o, p) and hasattr(o, z):
+                            return getattr(o, s), getattr(o, p), getattr(o, z)
 
-        # style C: kwargs
-        side = kwargs.get("side", None)
-        price = kwargs.get("price", None)
-        size = kwargs.get("size", None)
-        if side is not None and price is not None and size is not None:
-            return str(side), float(price), float(size)
+        # kwargs style
+        if "side" in kwargs and "price" in kwargs and "size" in kwargs:
+            return kwargs["side"], kwargs["price"], kwargs["size"]
 
-        raise TypeError("place_order() could not extract (side, price, size) from given args/kwargs")
+        raise RuntimeError("place_order() could not extract (side, price, size)")
 
-    def _normalize_intent(self, side: str, price: float, size: float) -> OrderIntent | None:
-        # side normalize
-        side_u = str(side).upper().strip()
-        # Handle enum-ish strings like "OrderSide.BUY"
-        if "." in side_u:
-            side_u = side_u.split(".")[-1].strip()
+    # -----------------------------
+    # place order
+    # -----------------------------
 
-        if side_u not in ("BUY", "SELL"):
-            log.error("Invalid side=%s (must be BUY/SELL). BLOCK.", side)
-            return None
+    async def place_order(self, *args, **kwargs):
 
-        p = float(price)
-        s = float(size)
+        side, price, size = self._extract(*args, **kwargs)
 
-        if p <= 0:
-            log.error("Invalid price<=0 price=%s BLOCK.", p)
-            return None
-        if s <= 0:
-            log.error("Invalid size<=0 size=%s BLOCK.", s)
-            return None
+        side = self._normalize_side(side)
+        price = float(price)
+        size = float(size)
 
-        # Optional rounding
-        if self.price_tick is not None and self.price_tick > 0:
-            p2 = self._round_floor(p, self.price_tick)
-            if p2 <= 0:
-                log.error("Price rounding resulted <=0. price=%s tick=%s BLOCK.", p, self.price_tick)
-                return None
-            if p2 != p:
-                log.info("Price rounded: %s -> %s (tick=%s)", p, p2, self.price_tick)
-            p = p2
+        if self.maker_mode == "validate":
+            log.info(
+                "[VALIDATE] side=%s price=%s size=%s",
+                side,
+                price,
+                size,
+            )
+            return {"ok": True}
 
-        if self.size_step is not None and self.size_step > 0:
-            s2 = self._round_floor(s, self.size_step)
-            if s2 <= 0:
-                log.error("Size rounding resulted <=0. size=%s step=%s BLOCK.", s, self.size_step)
-                return None
-            if s2 != s:
-                log.info("Size rounded: %s -> %s (step=%s)", s, s2, self.size_step)
-            s = s2
-
-        if self.min_size is not None and s < self.min_size:
-            log.error("Size below min. size=%s min_size=%s BLOCK.", s, self.min_size)
-            return None
-
-        if self.max_size is not None and s > self.max_size:
-            log.error("Size above max. size=%s max_size=%s BLOCK.", s, self.max_size)
-            return None
-
-        return OrderIntent(
-            symbol=self.symbol,
-            contract_id=self.contract_id,
-            side=side_u,
-            price=p,
-            size=s,
-        )
-
-    # -------------------------
-    # order entry points (MUST exist)
-    # -------------------------
-    def place_order(self, *args, **kwargs) -> dict:
-        """
-        grid_engine calls this in different ways. We accept all common call styles.
-        """
-        side, price, size = self._extract_side_price_size(*args, **kwargs)
-        intent = self._normalize_intent(side=side, price=price, size=size)
-        if intent is None:
-            return {"ok": False, "reason": "validation_failed"}
-
-        self._rate_limit_sleep()
-
-        # validate mode
-        if self.maker_mode in ("validate", "paper", "dry_run"):
-            log.info("[VALIDATE_MODE] would place order: %s", intent.to_dict())
-            return {"ok": True, "mode": "validate", "intent": intent.to_dict()}
-
-        # live mode: real call is intentionally NOT implemented yet (safety)
-        return self._place_order_real(intent)
-
-    def place_limit_order(self, side: str, price: float, size: float) -> dict:
-        return self.place_order(side, price, size)
-
-    async def place_order_async(self, *args, **kwargs) -> dict:
-        return self.place_order(*args, **kwargs)
-
-    async def place_limit_order_async(self, side: str, price: float, size: float) -> dict:
-        return self.place_order(side, price, size)
-
-    def _place_order_real(self, intent: OrderIntent) -> dict:
-        log.critical("LIVE MODE requested but REAL order path is NOT implemented. intent=%s", intent.to_dict())
-        raise RuntimeError("LIVE mode requested but EdgeX real order placement is not implemented.")
+        raise RuntimeError("LIVE MODE not implemented")
 
 
 class EdgeXSDKAdapter(EdgeXAdapter):
-    """
-    Compatibility wrapper expected by run_edgex_grid.py:
-      EdgeXSDKAdapter(base_url, account_id, stark_private_key, ...)
-    contract_id/symbol are read from env by default.
-    """
+    def __init__(self, base_url, account_id, stark_private_key, **kwargs):
 
-    def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
-        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
-        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
+        contract_id = _env("EDGEX_CONTRACT_ID")
+        symbol = _env("EDGEX_SYMBOL", contract_id)
 
-        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
-        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
-            symbol = contract_id
-
-        if symbol is None or symbol == "":
-            symbol = contract_id if contract_id is not None else "UNKNOWN"
-
-        if contract_id is None or str(contract_id).strip() == "":
-            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
+        if not contract_id:
+            raise RuntimeError("EDGEX_CONTRACT_ID missing")
 
         super().__init__(
-            base_url=base_url,
-            account_id=account_id,
-            stark_private_key=stark_private_key,
-            contract_id=str(contract_id),
-            symbol=str(symbol),
-            **kwargs,
+            base_url,
+            account_id,
+            stark_private_key,
+            contract_id,
+            symbol,
         )
