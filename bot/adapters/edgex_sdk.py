@@ -52,6 +52,9 @@ class OrderIntent:
 class EdgeXAdapter:
     """
     ✅ 実発注の入口。DRY_RUNは必ず二重ガードで止める。
+
+    元BOT側が `await adapter.connect()` を呼ぶ設計なので、
+    connect() は必ず用意する（最低限は no-op でOK）。
     """
 
     def __init__(
@@ -85,6 +88,9 @@ class EdgeXAdapter:
         self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
         self._last_op_ts = 0.0
 
+        # SDKクライアントを持つ場合はここで作る（将来差し替え用）
+        self.client = None
+
         log.info(
             "Adapter init: base_url=%s symbol=%s contract_id=%s dry_run=%s force_dry_run=%s "
             "min_size=%s max_size=%s size_step=%s price_tick=%s op_spacing_sec=%.2f",
@@ -103,6 +109,20 @@ class EdgeXAdapter:
         if self.force_dry_run:
             log.warning("🚧 DRY_RUN is ENABLED by env (DRY_RUN=1). Real orders are BLOCKED.")
 
+    async def connect(self) -> None:
+        """
+        ✅ 元BOT互換：grid_engine が await adapter.connect() を呼ぶため必須。
+        ここでは最低限「接続できた体」にする（DRY_RUNでも動く）。
+        実SDKが必要になったらここに初期化を入れる。
+        """
+        log.info("Adapter connect(): ok (no-op). base_url=%s symbol=%s contract_id=%s", self.base_url, self.symbol, self.contract_id)
+
+    async def close(self) -> None:
+        """
+        ✅ 元BOT互換：将来的に close が呼ばれても落ちないように。
+        """
+        log.info("Adapter close(): ok (no-op).")
+
     def _rate_limit_sleep(self) -> None:
         now = time.time()
         dt = now - self._last_op_ts
@@ -112,7 +132,7 @@ class EdgeXAdapter:
 
     def get_mid_price(self) -> float | None:
         """
-        TODO: 実装に差し替え（ここは元BOT側が別で価格取ってるなら未使用でもOK）
+        TODO: 実装に差し替え（元BOT側が別で価格取得してるなら未使用でもOK）
         """
         return None
 
@@ -202,35 +222,30 @@ class EdgeXAdapter:
 
 class EdgeXSDKAdapter(EdgeXAdapter):
     """
-    ✅ 互換クラス（超重要）
-    元の run_edgex_grid.py は、EdgeXSDKAdapter に
-    base_url/account_id/stark_private_key しか渡さない実装の可能性がある。
-
-    なので、足りない contract_id / symbol / dry_run は env から補完する。
+    ✅ 互換クラス：元の run_edgex_grid.py が base_url/account_id/stark_private_key だけ渡しても動くようにする。
+    足りない contract_id / symbol / dry_run は env から補完。
     """
 
     def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
-        # envから補完（ここがポイント）
         contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
         symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
 
-        # 元BOTの仕様：symbol_param=contractId のとき、symbolはcontract_idを入れる運用がある
+        # 元BOT仕様：symbol_param=contractId のとき、symbolはcontract_idを入れる流儀がある
         symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
         if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
             symbol = contract_id
 
-        # 最終フォールバック：symbolが空なら contract_id を使う（あなたのBOT流儀に寄せる）
+        # 最終フォールバック：symbolが空なら contract_id
         if symbol is None or symbol == "":
             symbol = contract_id if contract_id is not None else "UNKNOWN"
 
-        # dry_run も env から（DRY_RUN=1 を最優先で守る）
+        # dry_run は env 優先（DRY_RUN=1 を守る）
         dry_run_env = _truthy_env("DRY_RUN", default=True)
         dry_run = kwargs.pop("dry_run", None)
         if dry_run is None:
             dry_run = dry_run_env
 
         if contract_id is None:
-            # ここに来るのは env 未設定のときだけ
             raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
 
         super().__init__(
