@@ -252,4 +252,32 @@ class EdgeXSDKAdapter(EdgeXAdapter):
     """
 
     def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
-        contract_id = kwargs.pop("c_
+        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
+        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
+
+        # If bot uses "symbol_param=contractId" style, symbol should be the contractId.
+        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
+        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
+            symbol = contract_id
+
+        # Final fallback: use contract_id as symbol
+        if symbol is None or symbol == "":
+            symbol = contract_id if contract_id is not None else "UNKNOWN"
+
+        dry_run_env = _truthy_env("DRY_RUN", default=True)
+        dry_run = kwargs.pop("dry_run", None)
+        if dry_run is None:
+            dry_run = dry_run_env
+
+        if contract_id is None:
+            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
+
+        super().__init__(
+            base_url=base_url,
+            account_id=account_id,
+            stark_private_key=stark_private_key,
+            contract_id=str(contract_id),
+            symbol=str(symbol),
+            dry_run=bool(dry_run),
+            **kwargs,
+        )
