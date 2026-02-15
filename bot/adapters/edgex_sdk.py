@@ -122,14 +122,23 @@ class EdgeXAdapter:
     async def close(self) -> None:
         log.info("Adapter close(): OK (no-op).")
 
-    async def get_ticker(self) -> float:
+    async def get_ticker(self, *args, **kwargs) -> float:
         """
-        Required because grid_engine may call `await adapter.get_ticker()`.
-        If there is no real price feed yet, return a safe dummy price
-        and let the engine handle it (or keep DRY_RUN only).
+        Compatibility:
+        Some engines call get_ticker() with arguments (e.g., get_ticker(symbol)).
+        We accept *args/**kwargs to avoid signature mismatch.
+
+        For now, return a safe dummy price (DRY_RUN recommended).
+        Set EDGEX_DUMMY_TICKER_PRICE to override.
         """
         dummy_price = float(_env_float("EDGEX_DUMMY_TICKER_PRICE", 2000.0) or 2000.0)
-        log.warning("get_ticker(): returning DUMMY price=%s (set EDGEX_DUMMY_TICKER_PRICE to change)", dummy_price)
+        log.warning(
+            "get_ticker(): returning DUMMY price=%s (args=%s kwargs=%s). "
+            "Set EDGEX_DUMMY_TICKER_PRICE to change.",
+            dummy_price,
+            args,
+            kwargs,
+        )
         return dummy_price
 
     # -------------------------
@@ -243,32 +252,4 @@ class EdgeXSDKAdapter(EdgeXAdapter):
     """
 
     def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
-        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
-        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
-
-        # If bot uses "symbol_param=contractId" style, symbol should be the contractId.
-        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
-        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
-            symbol = contract_id
-
-        # Final fallback: use contract_id as symbol
-        if symbol is None or symbol == "":
-            symbol = contract_id if contract_id is not None else "UNKNOWN"
-
-        dry_run_env = _truthy_env("DRY_RUN", default=True)
-        dry_run = kwargs.pop("dry_run", None)
-        if dry_run is None:
-            dry_run = dry_run_env
-
-        if contract_id is None:
-            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
-
-        super().__init__(
-            base_url=base_url,
-            account_id=account_id,
-            stark_private_key=stark_private_key,
-            contract_id=str(contract_id),
-            symbol=str(symbol),
-            dry_run=bool(dry_run),
-            **kwargs,
-        )
+        contract_id = kwargs.pop("c_
