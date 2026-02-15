@@ -51,20 +51,7 @@ class OrderIntent:
 
 class EdgeXAdapter:
     """
-    ✅ ここが “実発注の入口”。
-    → DRY_RUNは「二重ガード」で必ず止める（事故防止）。
-
-    重要：あなたの既存コード（run_edgex_grid.py）が
-    `from bot.adapters.edgex_sdk import EdgeXSDKAdapter`
-    をしているので、下で互換クラス EdgeXSDKAdapter を用意してあります。
-
-    環境変数（安全装置系：任意）
-    - DRY_RUN=1                         : 最優先で実発注停止（強制）
-    - EDGEX_MIN_ORDER_SIZE              : 最小サイズ（例 BTC 0.003）
-    - EDGEX_MAX_ORDER_SIZE              : 最大サイズ（暴走防止）
-    - EDGEX_SIZE_STEP                   : サイズ刻み（例 0.001 など。未指定なら丸めしない）
-    - EDGEX_PRICE_TICK                  : 価格刻み（例 GOLDが0.1刻み等。未指定なら丸めしない）
-    - EDGEX_ADAPTER_OP_SPACING_SEC      : 注文間隔（レート制限/安全）
+    ✅ 実発注の入口。DRY_RUNは必ず二重ガードで止める。
     """
 
     def __init__(
@@ -76,7 +63,7 @@ class EdgeXAdapter:
         symbol: str,
         dry_run: bool,
         op_spacing_sec: float = 1.5,
-        **_kwargs,  # ← 既存コードが余分な引数を渡しても落ちないための保険
+        **_kwargs,
     ):
         self.base_url = str(base_url)
         self.account_id = str(account_id)
@@ -84,25 +71,19 @@ class EdgeXAdapter:
         self.contract_id = str(contract_id)
         self.symbol = str(symbol)
 
-        # ✅ 二重ガードの片方（初期値）
+        # ✅ 二重ガード：引数 + env
         self.dry_run = bool(dry_run)
-
-        # ✅ もう片方：環境変数で“強制DRY_RUN”
         self.force_dry_run = _truthy_env("DRY_RUN", default=True)
 
-        # ✅ 安全装置（サイズ/刻み）
-        self.min_size = _env_float("EDGEX_MIN_ORDER_SIZE", None)  # 例: BTC 0.003
-        self.max_size = _env_float("EDGEX_MAX_ORDER_SIZE", None)  # 例: 1.0 とか
-        self.size_step = _env_float("EDGEX_SIZE_STEP", None)      # 例: 0.001
-        self.price_tick = _env_float("EDGEX_PRICE_TICK", None)    # 例: 0.1
+        # ✅ 安全装置（任意）
+        self.min_size = _env_float("EDGEX_MIN_ORDER_SIZE", None)
+        self.max_size = _env_float("EDGEX_MAX_ORDER_SIZE", None)
+        self.size_step = _env_float("EDGEX_SIZE_STEP", None)
+        self.price_tick = _env_float("EDGEX_PRICE_TICK", None)
 
-        # ✅ レート制限/安全
         env_spacing = _env_float("EDGEX_ADAPTER_OP_SPACING_SEC", None)
         self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
         self._last_op_ts = 0.0
-
-        # TODO: あなたの環境のSDK初期化に置き換える
-        # self.client = EdgeXClient(base_url=self.base_url, account_id=self.account_id, stark_private_key=self.stark_private_key)
 
         log.info(
             "Adapter init: base_url=%s symbol=%s contract_id=%s dry_run=%s force_dry_run=%s "
@@ -131,9 +112,7 @@ class EdgeXAdapter:
 
     def get_mid_price(self) -> float | None:
         """
-        TODO: あなたの実装に置き換え（必須）
-        - SDK/RESTで best_bid / best_ask を取って mid を返す
-        - 価格が取れない時は None を返す（その場合、上位ロジックは停止する）
+        TODO: 実装に差し替え（ここは元BOT側が別で価格取ってるなら未使用でもOK）
         """
         return None
 
@@ -163,7 +142,6 @@ class EdgeXAdapter:
             log.error("Invalid size<=0 size=%s BLOCK.", s)
             return None
 
-        # 価格刻み（任意）
         if self.price_tick is not None and self.price_tick > 0:
             p2 = self._round_to_step(p, self.price_tick)
             if p2 <= 0:
@@ -173,7 +151,6 @@ class EdgeXAdapter:
                 log.info("Price rounded: %s -> %s (tick=%s)", p, p2, self.price_tick)
             p = p2
 
-        # サイズ刻み（任意）
         if self.size_step is not None and self.size_step > 0:
             s2 = self._round_to_step(s, self.size_step)
             if s2 <= 0:
@@ -183,7 +160,6 @@ class EdgeXAdapter:
                 log.info("Size rounded: %s -> %s (step=%s)", s, s2, self.size_step)
             s = s2
 
-        # 最小/最大サイズ（任意）
         if self.min_size is not None and s < self.min_size:
             log.error("Size below min. size=%s min_size=%s BLOCK.", s, self.min_size)
             return None
@@ -215,21 +191,54 @@ class EdgeXAdapter:
 
         self._place_order_real(intent)
 
-    # ✅ 既存コードが place_order(...) を呼んでいる可能性があるので互換メソッドも用意
+    # 互換：元コードが place_order を呼ぶ場合
     def place_order(self, side: str, price: float, size: float) -> None:
         self.place_limit_order(side=side, price=price, size=size)
 
     def _place_order_real(self, intent: OrderIntent) -> None:
-        """
-        TODO: ここをあなたの既存SDK呼び出しに置換してください（必須）
-        """
-        log.critical(
-            "REAL ORDER PATH is NOT implemented. BLOCKED. intent=%s",
-            intent.to_dict(),
-        )
+        log.critical("REAL ORDER PATH is NOT implemented. BLOCKED. intent=%s", intent.to_dict())
         raise RuntimeError("EdgeXAdapter._place_order_real is not implemented")
 
 
-# ✅ 互換：run_edgex_grid.py が import している名前を復活させる
 class EdgeXSDKAdapter(EdgeXAdapter):
-    pass
+    """
+    ✅ 互換クラス（超重要）
+    元の run_edgex_grid.py は、EdgeXSDKAdapter に
+    base_url/account_id/stark_private_key しか渡さない実装の可能性がある。
+
+    なので、足りない contract_id / symbol / dry_run は env から補完する。
+    """
+
+    def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
+        # envから補完（ここがポイント）
+        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
+        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
+
+        # 元BOTの仕様：symbol_param=contractId のとき、symbolはcontract_idを入れる運用がある
+        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
+        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
+            symbol = contract_id
+
+        # 最終フォールバック：symbolが空なら contract_id を使う（あなたのBOT流儀に寄せる）
+        if symbol is None or symbol == "":
+            symbol = contract_id if contract_id is not None else "UNKNOWN"
+
+        # dry_run も env から（DRY_RUN=1 を最優先で守る）
+        dry_run_env = _truthy_env("DRY_RUN", default=True)
+        dry_run = kwargs.pop("dry_run", None)
+        if dry_run is None:
+            dry_run = dry_run_env
+
+        if contract_id is None:
+            # ここに来るのは env 未設定のときだけ
+            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
+
+        super().__init__(
+            base_url=base_url,
+            account_id=account_id,
+            stark_private_key=stark_private_key,
+            contract_id=str(contract_id),
+            symbol=str(symbol),
+            dry_run=bool(dry_run),
+            **kwargs,
+        )
