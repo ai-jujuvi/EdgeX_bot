@@ -3,6 +3,7 @@ import time
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -21,16 +22,6 @@ def _env_float(name: str, default: float | None = None) -> float | None:
         return default
     try:
         return float(s)
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int | None = None) -> int | None:
-    s = _env_str(name, None)
-    if s is None:
-        return default
-    try:
-        return int(s)
     except Exception:
         return default
 
@@ -55,13 +46,12 @@ class OrderIntent:
 
 class EdgeXAdapter:
     """
-    Execution gateway.
+    Adapter must match grid_engine expectations.
 
-    IMPORTANT (per your new ops rule):
-    - NO DRY_RUN guard here.
-    - Stop/start is controlled by Render Suspend.
-    - "validate mode" is supported via EDGEX_MAKER_MODE=validate
-      to avoid sending real orders while still keeping the engine stable.
+    Your ops rule:
+    - NO DRY_RUN in code.
+    - Stop/start controlled by Render Suspend.
+    - Safety during testing is achieved via EDGEX_MAKER_MODE=validate.
     """
 
     def __init__(
@@ -80,21 +70,21 @@ class EdgeXAdapter:
         self.contract_id = str(contract_id)
         self.symbol = str(symbol)
 
-        # Rate limit between SDK ops (avoid burst)
+        # spacing (avoid bursts)
         env_spacing = _env_float("EDGEX_ADAPTER_OP_SPACING_SEC", None)
         self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
         self._last_op_ts = 0.0
 
-        # Maker mode: validate/live
+        # validate/live
         self.maker_mode = (_env_str("EDGEX_MAKER_MODE", "validate") or "validate").strip().lower()
 
-        # Optional rounding / validation rails (recommended)
+        # Optional rails
         self.min_size = _env_float("EDGEX_MIN_ORDER_SIZE", None)
         self.max_size = _env_float("EDGEX_MAX_ORDER_SIZE", None)
         self.size_step = _env_float("EDGEX_SIZE_STEP", None)
         self.price_tick = _env_float("EDGEX_PRICE_TICK", None)
 
-        # Optional: dummy ticker price for stability until real ticker is wired
+        # Temporary dummy ticker (until real API is wired)
         self.dummy_ticker_price = float(_env_float("EDGEX_DUMMY_TICKER_PRICE", 2000.0) or 2000.0)
 
         log.info(
@@ -113,7 +103,7 @@ class EdgeXAdapter:
         )
 
     # -------------------------
-    # Compatibility hooks (grid_engine expects these)
+    # grid_engine compatibility
     # -------------------------
     async def connect(self) -> None:
         log.info("Adapter connect(): OK (no-op).")
@@ -123,11 +113,7 @@ class EdgeXAdapter:
 
     async def get_ticker(self, *args, **kwargs):
         """
-        Engine expectations observed from logs:
-        - called with args (e.g., contract_id)
-        - return value must have `.price`
-
-        We return a SimpleNamespace with price/bid/ask/last for maximum compatibility.
+        grid_engine expects an object with .price
         """
         p = float(self.dummy_ticker_price)
         log.warning(
@@ -139,12 +125,36 @@ class EdgeXAdapter:
         )
         return SimpleNamespace(price=p, bid=p, ask=p, last=p)
 
-    # Some engines call adapter.get_mid_price()
     def get_mid_price(self) -> float | None:
         return float(self.dummy_ticker_price)
 
+    def list_active_orders(self, *args, **kwargs):
+        """
+        grid_engine may call this to check existing orders.
+        In validate mode (and for now), we return empty list.
+        """
+        if args or kwargs:
+            log.debug("list_active_orders(): args=%s kwargs=%s (returning empty)", args, kwargs)
+        return []
+
+    async def list_active_orders_async(self, *args, **kwargs):
+        return self.list_active_orders(*args, **kwargs)
+
+    def cancel_order(self, *args, **kwargs) -> dict:
+        """
+        Optional cancel path.
+        """
+        if self.maker_mode in ("validate", "paper", "dry_run"):
+            log.info("[VALIDATE_MODE] would cancel order: args=%s kwargs=%s", args, kwargs)
+            return {"ok": True, "mode": "validate", "action": "cancel"}
+        log.warning("cancel_order(): live cancel not implemented. args=%s kwargs=%s", args, kwargs)
+        return {"ok": False, "reason": "cancel_not_implemented"}
+
+    async def cancel_order_async(self, *args, **kwargs) -> dict:
+        return self.cancel_order(*args, **kwargs)
+
     # -------------------------
-    # Helpers
+    # internals
     # -------------------------
     def _rate_limit_sleep(self) -> None:
         now = time.time()
@@ -153,24 +163,72 @@ class EdgeXAdapter:
             time.sleep(self.op_spacing_sec - dt)
         self._last_op_ts = time.time()
 
-    def _round_to_step_floor(self, value: float, step: float) -> float:
+    def _round_floor(self, value: float, step: float) -> float:
         if step <= 0:
             return float(value)
         n = int(value / step)  # floor
         return float(n * step)
 
-    def _validate_and_normalize(self, side: str, price: float, size: float) -> OrderIntent | None:
+    def _extract_side_price_size(self, *args, **kwargs) -> tuple[str, float, float]:
+        """
+        Accept both call styles:
+        - place_order(side, price, size)
+        - place_order(order_obj)  (order_obj may have side/price/size or fields inside)
+        """
+        # style A: explicit args
+        if len(args) >= 3:
+            side = args[0]
+            price = args[1]
+            size = args[2]
+            return str(side), float(price), float(size)
+
+        # style B: single order object
+        if len(args) == 1 and not kwargs:
+            o = args[0]
+
+            # Some engines pass enum-like side (OrderSide.BUY). Make it string.
+            def _as_str(x: Any) -> str:
+                if hasattr(x, "name"):
+                    return str(x.name)
+                return str(x)
+
+            # Try common shapes
+            if hasattr(o, "side") and hasattr(o, "price") and hasattr(o, "size"):
+                return _as_str(getattr(o, "side")), float(getattr(o, "price")), float(getattr(o, "size"))
+
+            # Some pass dict-like
+            if isinstance(o, dict):
+                return _as_str(o.get("side")), float(o.get("price")), float(o.get("size"))
+
+            # Some pass order with nested fields
+            for side_key in ("side", "order_side"):
+                for price_key in ("price", "limit_price"):
+                    for size_key in ("size", "qty", "amount"):
+                        if hasattr(o, side_key) and hasattr(o, price_key) and hasattr(o, size_key):
+                            return _as_str(getattr(o, side_key)), float(getattr(o, price_key)), float(getattr(o, size_key))
+
+        # style C: kwargs
+        side = kwargs.get("side", None)
+        price = kwargs.get("price", None)
+        size = kwargs.get("size", None)
+        if side is not None and price is not None and size is not None:
+            return str(side), float(price), float(size)
+
+        raise TypeError("place_order() could not extract (side, price, size) from given args/kwargs")
+
+    def _normalize_intent(self, side: str, price: float, size: float) -> OrderIntent | None:
+        # side normalize
         side_u = str(side).upper().strip()
+        # Handle enum-ish strings like "OrderSide.BUY"
+        if "." in side_u:
+            side_u = side_u.split(".")[-1].strip()
+
         if side_u not in ("BUY", "SELL"):
             log.error("Invalid side=%s (must be BUY/SELL). BLOCK.", side)
             return None
 
-        try:
-            p = float(price)
-            s = float(size)
-        except Exception:
-            log.error("Invalid price/size (not float). price=%r size=%r BLOCK.", price, size)
-            return None
+        p = float(price)
+        s = float(size)
 
         if p <= 0:
             log.error("Invalid price<=0 price=%s BLOCK.", p)
@@ -179,9 +237,9 @@ class EdgeXAdapter:
             log.error("Invalid size<=0 size=%s BLOCK.", s)
             return None
 
-        # Round price/size if rails are provided
+        # Optional rounding
         if self.price_tick is not None and self.price_tick > 0:
-            p2 = self._round_to_step_floor(p, self.price_tick)
+            p2 = self._round_floor(p, self.price_tick)
             if p2 <= 0:
                 log.error("Price rounding resulted <=0. price=%s tick=%s BLOCK.", p, self.price_tick)
                 return None
@@ -190,7 +248,7 @@ class EdgeXAdapter:
             p = p2
 
         if self.size_step is not None and self.size_step > 0:
-            s2 = self._round_to_step_floor(s, self.size_step)
+            s2 = self._round_floor(s, self.size_step)
             if s2 <= 0:
                 log.error("Size rounding resulted <=0. size=%s step=%s BLOCK.", s, self.size_step)
                 return None
@@ -215,86 +273,8 @@ class EdgeXAdapter:
         )
 
     # -------------------------
-    # Order entry (sync + async compatibility)
+    # order entry points (MUST exist)
     # -------------------------
-    def place_limit_order(self, side: str, price: float, size: float) -> dict:
+    def place_order(self, *args, **kwargs) -> dict:
         """
-        Sync entry used by some code paths.
-        """
-        intent = self._validate_and_normalize(side=side, price=price, size=size)
-        if intent is None:
-            return {"ok": False, "reason": "validation_failed"}
-
-        self._rate_limit_sleep()
-
-        # validate mode: DO NOT place real orders (but also DO NOT crash)
-        if self.maker_mode in ("validate", "dry_run", "paper"):
-            log.info("[VALIDATE_MODE] would place order: %s", intent.to_dict())
-            return {"ok": True, "mode": "validate", "intent": intent.to_dict()}
-
-        # live mode: real call must be implemented in your SDK integration
-        return self._place_order_real(intent)
-
-    def place_order(self, side: str, price: float, size: float) -> dict:
-        """
-        Compatibility alias.
-        """
-        return self.place_limit_order(side=side, price=price, size=size)
-
-    async def place_order_async(self, side: str, price: float, size: float) -> dict:
-        """
-        Async entry used by some engines.
-        """
-        return self.place_limit_order(side=side, price=price, size=size)
-
-    async def cancel_order(self, *args, **kwargs) -> dict:
-        """
-        Optional: some engines try to cancel stale orders.
-        In validate mode we just log and return ok.
-        """
-        if self.maker_mode in ("validate", "dry_run", "paper"):
-            log.info("[VALIDATE_MODE] would cancel order: args=%s kwargs=%s", args, kwargs)
-            return {"ok": True, "mode": "validate", "action": "cancel", "args": args, "kwargs": kwargs}
-
-        log.warning("cancel_order(): live mode cancel not implemented. args=%s kwargs=%s", args, kwargs)
-        return {"ok": False, "reason": "cancel_not_implemented"}
-
-    def _place_order_real(self, intent: OrderIntent) -> dict:
-        """
-        REAL order path.
-        You can wire your actual EdgeX SDK call here later.
-        For now, we raise with an explicit message so it's impossible to "silently" place orders.
-        """
-        log.critical("LIVE MODE requested but REAL order path is NOT implemented. intent=%s", intent.to_dict())
-        raise RuntimeError("LIVE mode requested but EdgeX real order placement is not implemented.")
-
-
-class EdgeXSDKAdapter(EdgeXAdapter):
-    """
-    Compatibility wrapper:
-    Some code constructs EdgeXSDKAdapter(base_url, account_id, stark_private_key)
-    and expects env vars for contract/symbol.
-    """
-
-    def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
-        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
-        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
-
-        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
-        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
-            symbol = contract_id
-
-        if symbol is None or symbol == "":
-            symbol = contract_id if contract_id is not None else "UNKNOWN"
-
-        if contract_id is None or str(contract_id).strip() == "":
-            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
-
-        super().__init__(
-            base_url=base_url,
-            account_id=account_id,
-            stark_private_key=stark_private_key,
-            contract_id=str(contract_id),
-            symbol=str(symbol),
-            **kwargs,
-        )
+        grid_engine calls this in different ways. We accept all common call styles.
