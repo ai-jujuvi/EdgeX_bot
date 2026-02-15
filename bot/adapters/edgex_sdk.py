@@ -51,10 +51,10 @@ class OrderIntent:
 
 class EdgeXAdapter:
     """
-    ✅ 実発注の入口。DRY_RUNは必ず二重ガードで止める。
-
-    元BOT側が `await adapter.connect()` を呼ぶ設計なので、
-    connect() は必ず用意する（最低限は no-op でOK）。
+    Execution gateway.
+    DRY_RUN is enforced with double-guard:
+      - constructor arg `dry_run`
+      - env var `DRY_RUN=1` (always blocks real orders)
     """
 
     def __init__(
@@ -74,11 +74,11 @@ class EdgeXAdapter:
         self.contract_id = str(contract_id)
         self.symbol = str(symbol)
 
-        # ✅ 二重ガード：引数 + env
+        # Double DRY_RUN guard
         self.dry_run = bool(dry_run)
         self.force_dry_run = _truthy_env("DRY_RUN", default=True)
 
-        # ✅ 安全装置（任意）
+        # Optional safety rails (set via env)
         self.min_size = _env_float("EDGEX_MIN_ORDER_SIZE", None)
         self.max_size = _env_float("EDGEX_MAX_ORDER_SIZE", None)
         self.size_step = _env_float("EDGEX_SIZE_STEP", None)
@@ -88,7 +88,7 @@ class EdgeXAdapter:
         self.op_spacing_sec = max(0.2, float(env_spacing if env_spacing is not None else op_spacing_sec))
         self._last_op_ts = 0.0
 
-        # SDKクライアントを持つ場合はここで作る（将来差し替え用）
+        # SDK client placeholder (if you have one)
         self.client = None
 
         log.info(
@@ -107,22 +107,34 @@ class EdgeXAdapter:
         )
 
         if self.force_dry_run:
-            log.warning("🚧 DRY_RUN is ENABLED by env (DRY_RUN=1). Real orders are BLOCKED.")
+            log.warning("DRY_RUN is ENABLED by env (DRY_RUN=1). Real orders are BLOCKED.")
 
+    # -------------------------
+    # Compatibility hooks
+    # -------------------------
     async def connect(self) -> None:
         """
-        ✅ 元BOT互換：grid_engine が await adapter.connect() を呼ぶため必須。
-        ここでは最低限「接続できた体」にする（DRY_RUNでも動く）。
-        実SDKが必要になったらここに初期化を入れる。
+        Required because grid_engine calls `await adapter.connect()`.
+        No-op is fine for DRY_RUN mode.
         """
-        log.info("Adapter connect(): ok (no-op). base_url=%s symbol=%s contract_id=%s", self.base_url, self.symbol, self.contract_id)
+        log.info("Adapter connect(): OK (no-op).")
 
     async def close(self) -> None:
-        """
-        ✅ 元BOT互換：将来的に close が呼ばれても落ちないように。
-        """
-        log.info("Adapter close(): ok (no-op).")
+        log.info("Adapter close(): OK (no-op).")
 
+    async def get_ticker(self) -> float:
+        """
+        Required because grid_engine may call `await adapter.get_ticker()`.
+        If there is no real price feed yet, return a safe dummy price
+        and let the engine handle it (or keep DRY_RUN only).
+        """
+        dummy_price = float(_env_float("EDGEX_DUMMY_TICKER_PRICE", 2000.0) or 2000.0)
+        log.warning("get_ticker(): returning DUMMY price=%s (set EDGEX_DUMMY_TICKER_PRICE to change)", dummy_price)
+        return dummy_price
+
+    # -------------------------
+    # Helpers
+    # -------------------------
     def _rate_limit_sleep(self) -> None:
         now = time.time()
         dt = now - self._last_op_ts
@@ -132,14 +144,14 @@ class EdgeXAdapter:
 
     def get_mid_price(self) -> float | None:
         """
-        TODO: 実装に差し替え（元BOT側が別で価格取得してるなら未使用でもOK）
+        Optional (if your bot uses mid-price).
         """
         return None
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step <= 0:
             return float(value)
-        n = int(value / step)  # 切り捨て
+        n = int(value / step)  # floor
         return float(n * step)
 
     def _validate_and_normalize(self, side: str, price: float, size: float) -> OrderIntent | None:
@@ -198,6 +210,9 @@ class EdgeXAdapter:
     def _is_dry_run_effective(self) -> bool:
         return bool(self.dry_run) or bool(self.force_dry_run)
 
+    # -------------------------
+    # Order entry
+    # -------------------------
     def place_limit_order(self, side: str, price: float, size: float) -> None:
         intent = self._validate_and_normalize(side=side, price=price, size=size)
         if intent is None:
@@ -211,7 +226,7 @@ class EdgeXAdapter:
 
         self._place_order_real(intent)
 
-    # 互換：元コードが place_order を呼ぶ場合
+    # Compatibility: some code calls place_order()
     def place_order(self, side: str, price: float, size: float) -> None:
         self.place_limit_order(side=side, price=price, size=size)
 
@@ -222,24 +237,24 @@ class EdgeXAdapter:
 
 class EdgeXSDKAdapter(EdgeXAdapter):
     """
-    ✅ 互換クラス：元の run_edgex_grid.py が base_url/account_id/stark_private_key だけ渡しても動くようにする。
-    足りない contract_id / symbol / dry_run は env から補完。
+    Compatibility wrapper:
+    - Some bots construct EdgeXSDKAdapter(base_url, account_id, stark_private_key) only.
+    - We fill missing fields from Render env vars.
     """
 
     def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
         contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
         symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
 
-        # 元BOT仕様：symbol_param=contractId のとき、symbolはcontract_idを入れる流儀がある
+        # If bot uses "symbol_param=contractId" style, symbol should be the contractId.
         symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
         if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
             symbol = contract_id
 
-        # 最終フォールバック：symbolが空なら contract_id
+        # Final fallback: use contract_id as symbol
         if symbol is None or symbol == "":
             symbol = contract_id if contract_id is not None else "UNKNOWN"
 
-        # dry_run は env 優先（DRY_RUN=1 を守る）
         dry_run_env = _truthy_env("DRY_RUN", default=True)
         dry_run = kwargs.pop("dry_run", None)
         if dry_run is None:
