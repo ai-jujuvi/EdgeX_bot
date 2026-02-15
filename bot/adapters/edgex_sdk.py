@@ -1,74 +1,60 @@
 import os
-import asyncio
 import logging
-from typing import Any, Dict, List, Optional
-
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 
 class EdgeXSDKAdapter:
     """
-    Minimal compatibility adapter for grid_engine.
-
-    This version:
-    - Accepts flexible place_order signatures
-    - Returns dummy ticker price
-    - Prevents crash in async context
+    Compatibility adapter for grid_engine.
     """
 
-    def __init__(self, contract_id: str, symbol: str, dry_run: bool = False):
+    def __init__(
+        self,
+        base_url: str,
+        contract_id: str,
+        symbol: str,
+        dry_run: bool = False,
+        **kwargs
+    ):
+        self.base_url = base_url
         self.contract_id = contract_id
         self.symbol = symbol
         self.dry_run = dry_run
-        self._dummy_price = float(os.getenv("EDGEX_DUMMY_TICKER_PRICE", "2000"))
 
-        logger.info(f"EdgeXSDKAdapter initialized: contract_id={contract_id}")
+        self._dummy_price = float(
+            os.getenv("EDGEX_DUMMY_TICKER_PRICE", "2000")
+        )
+
+        logger.info(
+            f"Adapter init: base_url={base_url}, contract_id={contract_id}"
+        )
 
     async def connect(self):
-        logger.info("Adapter connect() called")
         return True
 
     async def get_ticker(self, *args, **kwargs) -> Dict[str, float]:
-        """
-        Always return dummy ticker.
-        """
-        logger.debug(
-            f"get_ticker(): returning DUMMY price={self._dummy_price} "
-            f"(args={args}, kwargs={kwargs})"
-        )
         return {"price": self._dummy_price}
 
     async def list_active_orders(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        """
-        Return empty active orders.
-        """
         return []
 
     async def place_order(self, *args, **kwargs) -> Dict[str, Any]:
-        """
-        Flexible extractor for:
-            place_order(side, price, size)
-            place_order(side=..., price=..., size=...)
-            place_order(dict)
-        """
 
         side = None
         price = None
         size = None
 
-        # Case 1: dict passed as single positional
         if len(args) == 1 and isinstance(args[0], dict):
             data = args[0]
             side = data.get("side")
             price = data.get("price")
             size = data.get("size")
 
-        # Case 2: positional args
         elif len(args) >= 3:
             side, price, size = args[:3]
 
-        # Case 3: keyword args
         else:
             side = kwargs.get("side")
             price = kwargs.get("price")
@@ -92,5 +78,4 @@ class EdgeXSDKAdapter:
         }
 
     async def cancel_order(self, *args, **kwargs) -> bool:
-        logger.info("cancel_order called (validate only)")
         return True
