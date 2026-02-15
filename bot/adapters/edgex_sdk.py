@@ -278,3 +278,62 @@ class EdgeXAdapter:
     def place_order(self, *args, **kwargs) -> dict:
         """
         grid_engine calls this in different ways. We accept all common call styles.
+        """
+        side, price, size = self._extract_side_price_size(*args, **kwargs)
+        intent = self._normalize_intent(side=side, price=price, size=size)
+        if intent is None:
+            return {"ok": False, "reason": "validation_failed"}
+
+        self._rate_limit_sleep()
+
+        # validate mode
+        if self.maker_mode in ("validate", "paper", "dry_run"):
+            log.info("[VALIDATE_MODE] would place order: %s", intent.to_dict())
+            return {"ok": True, "mode": "validate", "intent": intent.to_dict()}
+
+        # live mode: real call is intentionally NOT implemented yet (safety)
+        return self._place_order_real(intent)
+
+    def place_limit_order(self, side: str, price: float, size: float) -> dict:
+        return self.place_order(side, price, size)
+
+    async def place_order_async(self, *args, **kwargs) -> dict:
+        return self.place_order(*args, **kwargs)
+
+    async def place_limit_order_async(self, side: str, price: float, size: float) -> dict:
+        return self.place_order(side, price, size)
+
+    def _place_order_real(self, intent: OrderIntent) -> dict:
+        log.critical("LIVE MODE requested but REAL order path is NOT implemented. intent=%s", intent.to_dict())
+        raise RuntimeError("LIVE mode requested but EdgeX real order placement is not implemented.")
+
+
+class EdgeXSDKAdapter(EdgeXAdapter):
+    """
+    Compatibility wrapper expected by run_edgex_grid.py:
+      EdgeXSDKAdapter(base_url, account_id, stark_private_key, ...)
+    contract_id/symbol are read from env by default.
+    """
+
+    def __init__(self, base_url: str, account_id: str, stark_private_key: str, *args, **kwargs):
+        contract_id = kwargs.pop("contract_id", None) or _env_str("EDGEX_CONTRACT_ID", None)
+        symbol = kwargs.pop("symbol", None) or _env_str("EDGEX_SYMBOL", None)
+
+        symbol_param = _env_str("EDGEX_SYMBOL_PARAM", None)
+        if (symbol is None or symbol == "") and symbol_param and symbol_param.lower() == "contractid":
+            symbol = contract_id
+
+        if symbol is None or symbol == "":
+            symbol = contract_id if contract_id is not None else "UNKNOWN"
+
+        if contract_id is None or str(contract_id).strip() == "":
+            raise RuntimeError("EDGEX_CONTRACT_ID is missing. Set it in Render Environment.")
+
+        super().__init__(
+            base_url=base_url,
+            account_id=account_id,
+            stark_private_key=stark_private_key,
+            contract_id=str(contract_id),
+            symbol=str(symbol),
+            **kwargs,
+        )
