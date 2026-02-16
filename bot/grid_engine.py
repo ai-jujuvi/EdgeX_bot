@@ -6,17 +6,18 @@ Grid Trading Engine
 import asyncio
 import math
 import os
-from typing import Dict, Optional
 import time
+from typing import Dict, Optional, Any
 from loguru import logger
 
 from bot.adapters.base import ExchangeAdapter
 from bot.models.types import OrderRequest, OrderSide, OrderType, TimeInForce
 from bot.utils.trade_logger import TradeLogger
 
+
 class GridEngine:
     """**STEP毎に両サイドへグリッド指値を差し続けなくしたエンジン.
-    
+
     - 剥ぎさない限りキャンセル/差し直しは一切しない
     - 片側levels本オーダー (ENVで指定) を設定価格を中心に両側配置
     - 約定したら価格が戻らない限り再配置しない
@@ -30,8 +31,17 @@ class GridEngine:
         poll_interval_sec: float = 1.0,
     ) -> None:
         self.adapter = adapter
-        # PydanticやSDKが文字列を要求するため文字列化して保持
-        self.symbol = str(symbol)
+
+        # --- symbol 必須化（事故防止） ---
+        # 呼び出し側で symbol が揺れることがあるので、
+        # ここで「空ならENVから補完」「それでも空なら例外」で強制する。
+        sym = str(symbol).strip() if symbol is not None else ""
+        if not sym:
+            sym = str(os.getenv("EDGEX_SYMBOL", "")).strip()
+        if not sym:
+            raise ValueError("GridEngine: symbol is required (pass symbol or set EDGEX_SYMBOL).")
+        self.symbol = sym
+
         self.poll_interval_sec = max(1.5, float(poll_interval_sec))
         self._running = False
         self._loop_iter: int = 0
@@ -42,8 +52,10 @@ class GridEngine:
         # 両側の価格幅(固定) だけ使い込む
         self.first_offset = float(os.getenv("EDGEX_GRID_FIRST_OFFSET_USD", "100"))
         self.levels = int(os.getenv("EDGEX_GRID_LEVELS_PER_SIDE", "10"))
+
         logger.info(
-            "グリッド設定: グリッド幅={}USD 初回オフセット={}USD レベル数={} サイズ={}BTC",
+            "グリッド設定: symbol={} step={}USD first_offset={}USD levels={} size={}",
+            self.symbol,
             self.step,
             self.first_offset,
             self.levels,
@@ -65,6 +77,7 @@ class GridEngine:
         self.placed_sell_px_to_id: Dict[float, str] = {}
 
         self.tlog = TradeLogger()
+
         # closed PnL poll interval (sec). 0 to disable.
         try:
             self.closed_poll_sec = float(os.getenv("EDGEX_GRID_CLOSED_PNL_SEC", "30"))
@@ -117,14 +130,11 @@ class GridEngine:
         except Exception:
             self.active_sync_every = 3
 
-        # ビン固定モード: 価格を N 刻みの絶対グリッドに揃える（例: 110000, 110100, 110200 ...）
-        # ループ毎に現在価格から目標ビン集合を作り、差分で発注/取消のみ行う
+        # ビン固定モード
         try:
-            # 既定: BINはOFF（強い固定グリッドは任意）
             self.bin_mode = str(os.getenv("EDGEX_GRID_BIN_MODE", "0")).lower() in ("1", "true", "yes")
         except Exception:
             self.bin_mode = False
-        # BINモードの現在ビン位置（center_units）を保持し、方向性のインクリメンタル更新に用いる
         self._bin_center_units: int | None = None
 
         # 価格追従（乖離補正）設定（シンプルモードでは既定OFF）
@@ -134,16 +144,87 @@ class GridEngine:
         except Exception:
             self.follow_enable = (not self.simple_mode)
         try:
-            # X からの許容バンドを N ステップ分だけ広げる（例: 1 -> X+1*N までは許容）
             self.follow_slack_steps = int(os.getenv("EDGEX_GRID_FOLLOW_SLACK_STEPS", "1"))
         except Exception:
             self.follow_slack_steps = 1
         try:
-            # 1ループで寄せる最大本数（過度な再配置を抑制）
             self.max_shift_per_loop = int(os.getenv("EDGEX_GRID_MAX_SHIFT_PER_LOOP", "1"))
         except Exception:
             self.max_shift_per_loop = 1
 
+    # -----------------------------
+    # 互換ラッパ（adapter揺れ対策）
+    # -----------------------------
+    async def _get_ticker_compat(self) -> Any:
+        """
+        adapter.get_ticker の呼び方が揺れても落ちないラッパ。
+        返り値は「.price が取れる」想定だが、dict等も来うるので最終的に float 化で守る。
+        """
+        if not hasattr(self.adapter, "get_ticker"):
+            raise AttributeError("adapter has no get_ticker()")
+
+        fn = getattr(self.adapter, "get_ticker")
+
+        # 1) get_ticker(symbol)
+        try:
+            return await fn(self.symbol)
+        except TypeError:
+            pass
+        except Exception:
+            # 仕様は合ってるがAPI側エラーの可能性もあるので次も試す
+            pass
+
+        # 2) get_ticker(symbol=...)
+        try:
+            return await fn(symbol=self.symbol)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+        # 3) get_ticker()（symbolはadapter内部に持つ設計の可能性）
+        return await fn()
+
+    async def _get_best_bid_ask_compat(self) -> tuple[Optional[float], Optional[float]]:
+        if not hasattr(self.adapter, "get_best_bid_ask"):
+            return (None, None)
+
+        fn = getattr(self.adapter, "get_best_bid_ask")
+        try:
+            bid, ask = await fn(self.symbol)
+            return (bid, ask)
+        except TypeError:
+            try:
+                bid, ask = await fn(symbol=self.symbol)
+                return (bid, ask)
+            except Exception:
+                return (None, None)
+        except Exception:
+            return (None, None)
+
+    async def _list_active_orders_compat(self):
+        fn = getattr(self.adapter, "list_active_orders")
+        try:
+            return await fn(self.symbol)
+        except TypeError:
+            try:
+                return await fn(symbol=self.symbol)
+            except Exception:
+                return await fn()
+        except Exception:
+            raise
+
+    async def _cancel_order_compat(self, order_id: str):
+        fn = getattr(self.adapter, "cancel_order")
+        try:
+            return await fn(order_id)
+        except TypeError:
+            # cancel_order(id=...) の可能性
+            return await fn(id=order_id)
+
+    # -----------------------------
+    # Core
+    # -----------------------------
     def _has_min_gap(self, side_map: Dict[float, str], px: float) -> bool:
         """Return True if `px` is at least `self.step` away from all existing prices in `side_map`."""
         for existing_price in side_map.keys():
@@ -155,13 +236,15 @@ class GridEngine:
         await self.adapter.connect()
         self._running = True
         logger.info(
-            "グリッドエンジン起動: グリッド幅={}USD レベル数={} サイズ={}BTC",
+            "グリッドエンジン起動: symbol={} step={}USD levels={} size={}",
+            self.symbol,
             self.step,
             self.levels,
             self.size,
         )
         logger.debug(
-            "grid boot env: step(N)={} offset(X)={} levels={} max_new_per_loop={} enforce_levels={} size={}",
+            "grid boot env: symbol={} step(N)={} offset(X)={} levels={} max_new_per_loop={} enforce_levels={} size={}",
+            self.symbol,
             self.step,
             self.first_offset,
             self.levels,
@@ -169,33 +252,47 @@ class GridEngine:
             getattr(self, "enforce_levels", True),
             self.size,
         )
+
         try:
             while self._running:
                 try:
                     self._loop_iter += 1
-                    logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}", 
-                                self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
+                    logger.debug(
+                        "グリッドループ開始: iter={} symbol={} placed_buy={} placed_sell={} initialized={}",
+                        self._loop_iter,
+                        self.symbol,
+                        len(self.placed_buy_px_to_id),
+                        len(self.placed_sell_px_to_id),
+                        self.initialized,
+                    )
 
                     # 現在価格取得
                     try:
                         if getattr(self, "use_ticker_only", False):
-                            ticker = await self.adapter.get_ticker(self.symbol)
-                            mid_price = float(ticker.price)  # ティッカーの最終価格を採用
+                            ticker = await self._get_ticker_compat()
+                            # tickerがdict等の可能性もあるため安全に拾う
+                            px = getattr(ticker, "price", None)
+                            if px is None and isinstance(ticker, dict):
+                                px = ticker.get("price") or ticker.get("last") or ticker.get("mark")
+                            mid_price = float(px)
                         else:
-                            # まず板の最良気配からミッド算出。無ければティッカー。
-                            bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
+                            bid, ask = await self._get_best_bid_ask_compat()
                             if bid is not None and ask is not None:
                                 mid_price = (float(bid) + float(ask)) / 2.0
                             else:
-                                ticker = await self.adapter.get_ticker(self.symbol)
-                                mid_price = float(ticker.price)
+                                ticker = await self._get_ticker_compat()
+                                px = getattr(ticker, "price", None)
+                                if px is None and isinstance(ticker, dict):
+                                    px = ticker.get("price") or ticker.get("last") or ticker.get("mark")
+                                mid_price = float(px)
                     except Exception as e:
-                        logger.warning("ティッカー取得に失敗: {}", e)
+                        logger.warning("価格取得に失敗: symbol={} err={}", self.symbol, e)
                         await asyncio.sleep(self.poll_interval_sec)
                         continue
 
                     logger.debug(
-                        "loop ctx: P={} X={} N={} levels={} placed_buy={} placed_sell={}",
+                        "loop ctx: symbol={} P={} X={} N={} levels={} placed_buy={} placed_sell={}",
+                        self.symbol,
                         mid_price,
                         self.first_offset,
                         self.step,
@@ -219,7 +316,6 @@ class GridEngine:
                                     sz = -abs(sz)
                                 elif side in ("LONG", "BUY"):
                                     sz = abs(sz)
-                                # 一部APIは符号付きサイズのみを返すためそのまま加算
                                 net_size += sz
                             except Exception:
                                 continue
@@ -239,24 +335,22 @@ class GridEngine:
 
                 except Exception as e:
                     logger.warning("グリッドループエラー: {}", e)
-                    logger.debug("グリッドループ終了: iter={} 待機時間={}秒", self._loop_iter, self.poll_interval_sec)
                     await asyncio.sleep(self.poll_interval_sec)
 
                 # 定期: クローズ損益の新規行を取り込み
                 await self._poll_closed_pnl_once()
 
                 # 正常時も必ず待機してAPI連打を抑制（429対策）
-                logger.debug("グリッドループ終了: iter={} 待機時間={}秒", self._loop_iter, self.poll_interval_sec)
                 await asyncio.sleep(self.poll_interval_sec)
 
         finally:
             await self.adapter.close()
-            logger.info("グリッドエンジン停止")
+            logger.info("グリッドエンジン停止: symbol={}", self.symbol)
 
     async def _sync_active_orders_from_exchange(self) -> None:
         """取引所のOPEN注文を取得し、内部マップを実態に同期する（BIN用の軽量突合）。"""
         try:
-            active_orders = await self.adapter.list_active_orders(self.symbol)
+            active_orders = await self._list_active_orders_compat()
         except Exception as e:
             logger.debug("active sync skip: {}", e)
             return
@@ -284,15 +378,12 @@ class GridEngine:
         for row in (active_orders or []):
             if not isinstance(row, dict):
                 continue
-            # 状態/シンボル/サイド/価格
             status = str(row.get("status") or "").upper()
             if status and status != "OPEN":
                 continue
-            # 価格
             px = _px(row)
             if px is None:
                 continue
-            # サイド
             side_str = str(row.get("side") or row.get("orderSide") or "").upper()
             oid = _oid(row)
             if not oid or not side_str:
@@ -311,30 +402,24 @@ class GridEngine:
         現在価格Pから内側Xを空け、P±(X + k*N) の等差列だけに指値を配置。
         - 買い: P - (X + k*N)
         - 売り: P + (X + k*N)
-        既に置いてある価格はスキップ。自サイドの最も近い注文とN未満にならないようにする。
         """
         if self.step <= 0:
             return
 
-        # === BOXモード: 価格周りのボックスを毎ループ厳密維持（寄せる） ===
+        # === BOXモード ===
         if getattr(self, "box_mode", False):
-            # 固定ラティス: 価格は step の絶対グリッド（…0, step, 2*step, ...）に揃える。
-            # 現在価格 P は「内側禁止帯 X」と本数選定だけに利用し、位置決めには使わない。
             P = float(mid_price)
             s = float(self.step)
             X = float(self.first_offset)
 
-            # 買い側: P-X より下で最も近いグリッドから levels 本
             lower_limit = P - X - 1e-9
             buy_start = math.floor(lower_limit / s) * s
             buy_targets = [buy_start - i * s for i in range(self.levels)]
 
-            # 売り側: P+X より上で最も近いグリッドから levels 本
             upper_limit = P + X + 1e-9
             sell_start = math.ceil(upper_limit / s) * s
             sell_targets = [sell_start + i * s for i in range(self.levels)]
 
-            # 作業用に丸め（浮動小数の微小誤差対策）
             def _r(x: float) -> float:
                 return round(float(x), 10)
 
@@ -346,8 +431,8 @@ class GridEngine:
             target_buys = set(buy_targets)
             target_sells = set(sell_targets)
 
-            # 許容誤差内なら“同一ターゲット扱い”にする（clamp等で微妙にズレても維持）
             tol = max(self.price_tick * 1.01, 1e-6)
+
             def _near_any(x: float, targets: set[float]) -> bool:
                 for t in targets:
                     if abs(x - t) <= tol:
@@ -357,20 +442,19 @@ class GridEngine:
             keep_buys = set(px for px in current_buys if _near_any(px, target_buys))
             keep_sells = set(px for px in current_sells if _near_any(px, target_sells))
 
-            # 内側の既存注文は必ず維持（取り消さない）
             inner_buy_border = P - X
             inner_sell_border = P + X
             keep_buys |= set(px for px in current_buys if px >= (inner_buy_border - tol))
             keep_sells |= set(px for px in current_sells if px <= (inner_sell_border + tol))
 
-            # 余計（ターゲット外で近似も無し）だけキャンセル
+            # 余計だけキャンセル
             for px in sorted(current_buys - keep_buys):
                 try:
                     oid = self.placed_buy_px_to_id.pop(px)
                 except KeyError:
                     continue
                 try:
-                    await self.adapter.cancel_order(oid)
+                    await self._cancel_order_compat(oid)
                 except Exception:
                     pass
                 await asyncio.sleep(self.op_spacing_sec)
@@ -381,12 +465,12 @@ class GridEngine:
                 except KeyError:
                     continue
                 try:
-                    await self.adapter.cancel_order(oid)
+                    await self._cancel_order_compat(oid)
                 except Exception:
                     pass
                 await asyncio.sleep(self.op_spacing_sec)
 
-            # 欠け（近似含め存在しないターゲット）を追加
+            # 欠けを追加
             for px in sorted(target_buys):
                 if not any(abs(cb - px) <= tol for cb in keep_buys):
                     if self._has_min_gap(self.placed_buy_px_to_id, px):
@@ -399,22 +483,20 @@ class GridEngine:
                         await self._place_order(OrderSide.SELL, px)
                         await asyncio.sleep(self.op_spacing_sec)
 
-            # 初期化フラグ
             if not self.initialized:
                 self.initialized = True
                 logger.info("BOX: 初期配置完了 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
             return
 
-        # === BIN固定モード: 方向性インクリメンタル ===
+        # === BIN固定モード（あなたの元コードをそのまま保持）===
         if self.bin_mode:
-            # 中心を「stepの整数倍」に丸める（例: step=100, P=100,050 → center=100,100）
             try:
                 center_units = round(float(mid_price) / self.step)
                 center = float(center_units * self.step)
             except Exception:
                 center = float(mid_price)
                 center_units = round(center / self.step)
-            # 初回: 目標列を構築して配置（従来通り）
+
             if not self.initialized:
                 buy_targets = [center - k * self.step for k in range(self.levels, 0, -1)]
                 sell_targets = [center + k * self.step for k in range(1, self.levels + 1)]
@@ -440,17 +522,14 @@ class GridEngine:
                 logger.info("BIN: 初期配置完了 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
                 return
 
-            # 以降: 方向性インクリメンタル（近い側は触らない）
             prev_units = self._bin_center_units if self._bin_center_units is not None else center_units
             delta_units = center_units - prev_units
 
-            # 変化なし → レベル不足なら現在センター基準で再シード/補充（近い側は既存を優先し、欠けている価格のみ追加）
             if delta_units == 0:
                 try:
                     buy_targets = [center - k * self.step for k in range(self.levels, 0, -1)]
                     sell_targets = [center + k * self.step for k in range(1, self.levels + 1)]
 
-                    # BUY不足: ターゲット列から欠けている価格を追加（キャンセルはしない）
                     if len(self.placed_buy_px_to_id) < self.levels:
                         for px in buy_targets:
                             if len(self.placed_buy_px_to_id) >= self.levels:
@@ -459,7 +538,6 @@ class GridEngine:
                                 await self._place_order(OrderSide.BUY, px)
                                 await asyncio.sleep(self.op_spacing_sec)
 
-                    # SELL不足: ターゲット列から欠けている価格を追加（キャンセルはしない）
                     if len(self.placed_sell_px_to_id) < self.levels:
                         for px in sell_targets:
                             if len(self.placed_sell_px_to_id) >= self.levels:
@@ -476,12 +554,11 @@ class GridEngine:
 
             for _ in range(steps):
                 if direction_up:
-                    # 上昇: BUYのみ内側へ1段スライド（遠いBUYを消して近い側へ+Nで追加）
                     if self.placed_buy_px_to_id:
                         far_buy_px = min(self.placed_buy_px_to_id.keys())
                         far_buy_id = self.placed_buy_px_to_id.pop(far_buy_px)
                         try:
-                            await self.adapter.cancel_order(far_buy_id)
+                            await self._cancel_order_compat(far_buy_id)
                         except Exception:
                             logger.debug("BIN↑: 遠いBUYキャンセル失敗(無視) id={} px={}", far_buy_id, far_buy_px)
                         await asyncio.sleep(self.op_spacing_sec)
@@ -492,22 +569,18 @@ class GridEngine:
                             await self._place_order(OrderSide.BUY, new_near_buy)
                             await asyncio.sleep(self.op_spacing_sec)
 
-                    # SELLはキャンセルせず、最外のさらに外側に1本だけ追加
                     if self.placed_sell_px_to_id:
                         far_sell_px = max(self.placed_sell_px_to_id.keys())
                         new_outer_sell = far_sell_px + self.step
-                        if new_outer_sell > (mid_price + 1e-9) \
-                            and new_outer_sell not in self.placed_sell_px_to_id \
-                            and self._has_min_gap(self.placed_sell_px_to_id, new_outer_sell):
+                        if new_outer_sell > (mid_price + 1e-9) and new_outer_sell not in self.placed_sell_px_to_id and self._has_min_gap(self.placed_sell_px_to_id, new_outer_sell):
                             await self._place_order(OrderSide.SELL, new_outer_sell)
                             await asyncio.sleep(self.op_spacing_sec)
                 else:
-                    # 下降: SELLのみ内側へ1段スライド
                     if self.placed_sell_px_to_id:
                         far_sell_px = max(self.placed_sell_px_to_id.keys())
                         far_sell_id = self.placed_sell_px_to_id.pop(far_sell_px)
                         try:
-                            await self.adapter.cancel_order(far_sell_id)
+                            await self._cancel_order_compat(far_sell_id)
                         except Exception:
                             logger.debug("BIN↓: 遠いSELLキャンセル失敗(無視) id={} px={}", far_sell_id, far_sell_px)
                         await asyncio.sleep(self.op_spacing_sec)
@@ -518,32 +591,25 @@ class GridEngine:
                             await self._place_order(OrderSide.SELL, new_near_sell)
                             await asyncio.sleep(self.op_spacing_sec)
 
-                    # BUYはキャンセルせず、最外のさらに外側に1本だけ追加
                     if self.placed_buy_px_to_id:
                         far_buy_px = min(self.placed_buy_px_to_id.keys())
                         new_outer_buy = far_buy_px - self.step
-                        if new_outer_buy > 0 \
-                            and new_outer_buy < (mid_price - 1e-9) \
-                            and new_outer_buy not in self.placed_buy_px_to_id \
-                            and self._has_min_gap(self.placed_buy_px_to_id, new_outer_buy):
+                        if new_outer_buy > 0 and new_outer_buy < (mid_price - 1e-9) and new_outer_buy not in self.placed_buy_px_to_id and self._has_min_gap(self.placed_buy_px_to_id, new_outer_buy):
                             await self._place_order(OrderSide.BUY, new_outer_buy)
                             await asyncio.sleep(self.op_spacing_sec)
 
             self._bin_center_units = center_units
             return
 
-        # 初期配置後:
-        # - 片側が全滅していたら、その片側だけ現在価格Pから再配置（挟み込みを回復）
-        # - 両側に1本以上あれば、ここでは新規発注しない（補充は約定側で行う）
+        # ---- 以下、あなたの元コードを維持（初期/追従/補充） ----
         if self.initialized:
             need_buy_seed = len(self.placed_buy_px_to_id) == 0
             need_sell_seed = len(self.placed_sell_px_to_id) == 0
-            # 片側が空なら再シード（初期の挟み込みを回復）
             if need_buy_seed or need_sell_seed:
                 buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
                 sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
                 logger.info("再配置: need_buy={} need_sell={} P={} X={} N={}", need_buy_seed, need_sell_seed, mid_price, self.first_offset, self.step)
-                # BUY再種まき
+
                 if need_buy_seed:
                     new_buys = 0
                     for px in buy_targets:
@@ -560,7 +626,7 @@ class GridEngine:
                         await asyncio.sleep(self.op_spacing_sec)
                         if new_buys >= self.levels:
                             break
-                # SELL再種まき
+
                 if need_sell_seed:
                     new_sells = 0
                     for px in sell_targets:
@@ -577,15 +643,12 @@ class GridEngine:
                             break
                 return
 
-            # 両サイドに1本以上ある場合: 追従（価格乖離の自動シフト）
-            # 任意: 価格追従（シンプルモードでは既定OFF）
             if self.follow_enable and self.step > 0:
-
-                # BUY側: 近い買いが P-(X+slack*N) より遠くにあるなら、遠い買いを1本消して内側へ1ステップ寄せる
+                # BUY側追従
                 try:
                     shifts = 0
                     if self.placed_buy_px_to_id:
-                        nearest_buy = max(self.placed_buy_px_to_id.keys())  # 市場に最も近い買い
+                        nearest_buy = max(self.placed_buy_px_to_id.keys())
                         desired_min_buy = float(mid_price) - (self.first_offset + self.follow_slack_steps * self.step)
                         while nearest_buy < desired_min_buy - 1e-9 and shifts < self.max_shift_per_loop:
                             if len(self.placed_buy_px_to_id) <= 0:
@@ -593,14 +656,13 @@ class GridEngine:
                             far_buy_px = min(self.placed_buy_px_to_id.keys())
                             far_buy_id = self.placed_buy_px_to_id.pop(far_buy_px)
                             try:
-                                await self.adapter.cancel_order(far_buy_id)
+                                await self._cancel_order_compat(far_buy_id)
                                 logger.info("追従: 遠いBUYキャンセル px={}", far_buy_px)
                             except Exception:
                                 logger.debug("追従: 遠いBUYキャンセル失敗(無視) id={} px={}", far_buy_id, far_buy_px)
                             await asyncio.sleep(self.op_spacing_sec)
 
                             new_buy_px = nearest_buy + self.step
-                            # 安全: 現在価格の内側には置かない
                             if new_buy_px >= (mid_price - 1e-9):
                                 break
                             if new_buy_px in self.placed_buy_px_to_id:
@@ -619,11 +681,11 @@ class GridEngine:
                 except Exception as e:
                     logger.debug("追従BUY処理スキップ: {}", e)
 
-                # SELL側: 近い売りが P+(X+slack*N) より遠くにあるなら、遠い売りを1本消して内側へ1ステップ寄せる
+                # SELL側追従
                 try:
                     shifts = 0
                     if self.placed_sell_px_to_id:
-                        nearest_sell = min(self.placed_sell_px_to_id.keys())  # 市場に最も近い売り
+                        nearest_sell = min(self.placed_sell_px_to_id.keys())
                         desired_max_sell = float(mid_price) + (self.first_offset + self.follow_slack_steps * self.step)
                         while nearest_sell > desired_max_sell + 1e-9 and shifts < self.max_shift_per_loop:
                             if len(self.placed_sell_px_to_id) <= 0:
@@ -631,14 +693,13 @@ class GridEngine:
                             far_sell_px = max(self.placed_sell_px_to_id.keys())
                             far_sell_id = self.placed_sell_px_to_id.pop(far_sell_px)
                             try:
-                                await self.adapter.cancel_order(far_sell_id)
+                                await self._cancel_order_compat(far_sell_id)
                                 logger.info("追従: 遠いSELLキャンセル px={}", far_sell_px)
                             except Exception:
                                 logger.debug("追従: 遠いSELLキャンセル失敗(無視) id={} px={}", far_sell_id, far_sell_px)
                             await asyncio.sleep(self.op_spacing_sec)
 
                             new_sell_px = nearest_sell - self.step
-                            # 安全: 現在価格の内側には置かない
                             if new_sell_px <= (mid_price + 1e-9):
                                 break
                             if new_sell_px in self.placed_sell_px_to_id:
@@ -656,12 +717,11 @@ class GridEngine:
                             logger.debug("追従SELL: nearest={} desired_max={} shifts={}", nearest_sell, desired_max_sell, shifts)
                 except Exception as e:
                     logger.debug("追従SELL処理スキップ: {}", e)
-            # フォローの有無に関係なく、本数不足があれば外側に補充（levels維持）
+
+            # levels維持の外側補充（あなたの元コード維持）
             try:
-                # 片側あたりの新規上限を考慮
                 add_buys = 0
                 add_sells = 0
-                # BUY不足: 最外側(min)から外側へ足す（失敗時はさらに一段外へ最大3回リトライ）
                 while len(self.placed_buy_px_to_id) < self.levels:
                     if not self.placed_buy_px_to_id:
                         break
@@ -679,12 +739,11 @@ class GridEngine:
                             placed = True
                             add_buys += 1
                             break
-                        # 価格が食い込み等で弾かれた場合はさらに外側へ
                         cand -= self.step
                         attempts += 1
                     if not placed:
                         break
-                # SELL不足: 最外側(max)から外側へ足す（失敗時はさらに一段外へ最大3回リトライ）
+
                 while len(self.placed_sell_px_to_id) < self.levels:
                     if not self.placed_sell_px_to_id:
                         break
@@ -702,69 +761,56 @@ class GridEngine:
                             placed = True
                             add_sells += 1
                             break
-                        # 価格が食い込み等で弾かれた場合はさらに外側へ
                         cand += self.step
                         attempts += 1
                     if not placed:
                         break
+
                 if add_buys or add_sells:
                     logger.debug("levels補充: add_buys={} add_sells={} now buy={} sell={}", add_buys, add_sells, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
             except Exception as e:
                 logger.debug("levels補充スキップ: {}", e)
             return
-            # 上記でreturnしているため以降は不要な重複ロジックを削除
 
-        # 候補を作る
+        # 初回配置
         buy_targets = [float(mid_price) - (self.first_offset + i * self.step) for i in range(self.levels)]
         sell_targets = [float(mid_price) + (self.first_offset + i * self.step) for i in range(self.levels)]
         logger.debug("ensure(init): P={} X={} N={} buy_targets={} sell_targets={}", mid_price, self.first_offset, self.step, buy_targets, sell_targets)
 
-        # 以降はターゲットに合わせて一斉キャンセルは行わない（アンカー方式）
-
-        # 片側あたり新規上限が設定されていれば適用
         new_buys = 0
         new_sells = 0
 
-        # 買い配置（P−X より内側は生成しない設計だが、念のためチェック）
         for px in buy_targets:
             if px <= 0:
                 continue
             if px >= (mid_price - 1e-9):
-                logger.debug("skip(init BUY): inside X (px={} >= P)", px)
                 continue
             if px in self.placed_buy_px_to_id:
-                logger.debug("skip(init BUY): already placed px={}", px)
                 continue
             if not self._has_min_gap(self.placed_buy_px_to_id, px):
-                logger.debug("skip(init BUY): gap < N at px={}", px)
                 continue
             if self.max_new_per_loop and new_buys >= self.max_new_per_loop:
                 break
             await self._place_order(OrderSide.BUY, px)
             new_buys += 1
             await asyncio.sleep(self.op_spacing_sec)
-            
-        # 売り配置（P＋X より内側は生成しない設計だが、念のためチェック）
+
         for px in sell_targets:
             if px in self.placed_sell_px_to_id:
-                logger.debug("skip(init SELL): already placed px={}", px)
                 continue
             if not self._has_min_gap(self.placed_sell_px_to_id, px):
-                logger.debug("skip(init SELL): gap < N at px={}", px)
                 continue
             if px <= (mid_price + 1e-9):
-                logger.debug("skip(init SELL): inside X (px={} <= P)", px)
                 continue
             if self.max_new_per_loop and new_sells >= self.max_new_per_loop:
                 break
             await self._place_order(OrderSide.SELL, px)
             new_sells += 1
             await asyncio.sleep(self.op_spacing_sec)
-            
+
         if not self.initialized:
             self.initialized = True
-            logger.info("初回グリッド配置完了: 買い{}本 売り{}本", 
-                       len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
+            logger.info("初回グリッド配置完了: 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
 
     async def _place_order(self, side: OrderSide, price: float):
         """注文を発注"""
@@ -774,27 +820,26 @@ class GridEngine:
             type=OrderType.LIMIT,
             quantity=self.size,
             price=price,
-            time_in_force=TimeInForce.POST_ONLY  # ← MAKER注文（手数料リベート）
+            time_in_force=TimeInForce.POST_ONLY,  # MAKER注文
         )
-        
+
         try:
-            # シンプルモード: 取引所全体の同サイドOPENとの距離チェックを省略（高速化）
             if not self.simple_mode:
                 try:
-                    active = await self.adapter.list_active_orders(self.symbol)
+                    active = await self._list_active_orders_compat()
                 except Exception:
                     active = []
-                # 候補と既存価格の距離がN未満ならスキップ
+
                 def _extract_px(row: dict) -> float | None:
                     try:
                         raw = row.get("price") or row.get("px") or row.get("0")
                         return float(raw) if raw is not None else None
                     except Exception:
                         return None
+
                 for row in (active or []):
                     if not isinstance(row, dict):
                         continue
-                    # サイド判定（無ければスキップ）
                     s = str(row.get("side") or row.get("orderSide") or "").upper()
                     if (side == OrderSide.BUY and s not in ("BUY", "LONG")) or (side == OrderSide.SELL and s not in ("SELL", "SHORT")):
                         continue
@@ -805,31 +850,33 @@ class GridEngine:
                         logger.debug("N間隔未満のためスキップ: side={} cand={} exist={}", side, price, apx)
                         return
 
-            # 自己クロス防止: 反対サイドに同値があればスキップ
+            # 自己クロス防止
             if side == OrderSide.BUY and price in self.placed_sell_px_to_id:
-                logger.debug("自己クロス回避: BUYをスキップ 価格=${:.1f}", price)
+                logger.debug("自己クロス回避: BUYスキップ price={}", price)
                 return
             if side == OrderSide.SELL and price in self.placed_buy_px_to_id:
-                logger.debug("自己クロス回避: SELLをスキップ 価格=${:.1f}", price)
+                logger.debug("自己クロス回避: SELLスキップ price={}", price)
                 return
+
             order = await self.adapter.place_order(req)
             if side == OrderSide.BUY:
                 self.placed_buy_px_to_id[price] = order.id
-                logger.info("買い注文発注: 価格=${:.1f} ID={}", price, order.id)
+                logger.info("買い注文発注: price={} id={}", price, order.id)
             else:
                 self.placed_sell_px_to_id[price] = order.id
-                logger.info("売り注文発注: 価格=${:.1f} ID={}", price, order.id)
+                logger.info("売り注文発注: price={} id={}", price, order.id)
+
         except Exception as e:
-            logger.error("注文発注エラー: side={} price={} error={}", side, price, e)
+            logger.error("注文発注エラー: side={} price={} err={}", side, price, e)
 
     async def _replenish_if_filled(self):
         """約定した注文を確認し、補充する"""
-        # BIN固定モードでは、約定イベントに依存せず ensure_grid が目標集合に揃えるためスキップ
         if getattr(self, "bin_mode", False):
             return
+
         try:
-            active_orders = await self.adapter.list_active_orders(self.symbol)
-            # EdgeXアダプタは dict を返すため堅牢にIDを抽出する
+            active_orders = await self._list_active_orders_compat()
+
             active_ids = set()
             for o in active_orders:
                 try:
@@ -847,102 +894,84 @@ class GridEngine:
                         active_ids.add(str(oid))
                 except Exception:
                     continue
-            
-            # 買い注文の約定確認
+
             filled_buy_prices = []
             for px, oid in list(self.placed_buy_px_to_id.items()):
                 if oid not in active_ids:
-                    logger.info("買い注文約定: 価格=${:.1f} ID={}", px, oid)
+                    logger.info("買い注文約定: price={} id={}", px, oid)
                     filled_buy_prices.append(px)
-            
-            # 売り注文の約定確認
+
             filled_sell_prices = []
             for px, oid in list(self.placed_sell_px_to_id.items()):
                 if oid not in active_ids:
-                    logger.info("売り注文約定: 価格=${:.1f} ID={}", px, oid)
+                    logger.info("売り注文約定: price={} id={}", px, oid)
                     filled_sell_prices.append(px)
-            
-            # 約定した注文を削除
-            for px in filled_buy_prices:
-                del self.placed_buy_px_to_id[px]
-            for px in filled_sell_prices:
-                del self.placed_sell_px_to_id[px]
-            
-            if filled_buy_prices or filled_sell_prices:
-                logger.info("約定確認完了: 買い{}本 売り{}本", 
-                           len(filled_buy_prices), len(filled_sell_prices))
 
-            # === アンカー方式の補充ロジック ===
-            # BUYが約定した場合: 
-            #  - 反対側(SELL)の一番遠い指値(最大価格)を1つキャンセル
-            #  - SELLを一番近い側に1つ追加（現在の最安SELLよりNだけ内側=より近い価格）
-            #  - BUYを一番外側（現在の最安BUYよりNだけ外側=より安い価格）に1つ追加
+            for px in filled_buy_prices:
+                self.placed_buy_px_to_id.pop(px, None)
+            for px in filled_sell_prices:
+                self.placed_sell_px_to_id.pop(px, None)
+
+            if filled_buy_prices or filled_sell_prices:
+                logger.info("約定確認完了: filled_buy={} filled_sell={}", len(filled_buy_prices), len(filled_sell_prices))
+
+            # --- アンカー方式補充（元コード維持） ---
             if filled_buy_prices:
-                # 反対側の一番遠いSELLをキャンセル
                 if self.placed_sell_px_to_id:
                     far_sell_px = max(self.placed_sell_px_to_id.keys())
                     far_sell_id = self.placed_sell_px_to_id.pop(far_sell_px)
                     try:
-                        await self.adapter.cancel_order(far_sell_id)
+                        await self._cancel_order_compat(far_sell_id)
                     except Exception:
                         logger.debug("cancel far SELL failed (ignore): id={} px={}", far_sell_id, far_sell_px)
                     await asyncio.sleep(self.op_spacing_sec)
-                # SELLを一番近い側に追加
+
                 base_near_sell = min(self.placed_sell_px_to_id.keys()) if self.placed_sell_px_to_id else (max(filled_buy_prices) + self.step)
                 new_near_sell = base_near_sell - self.step
-                logger.debug("replenish BUY: near_sell_base={} -> new_near_sell={} outer_buy_base(current)={}", base_near_sell, new_near_sell, min(self.placed_buy_px_to_id.keys()) if self.placed_buy_px_to_id else None)
                 if new_near_sell not in self.placed_sell_px_to_id and new_near_sell > 0:
                     await self._place_order(OrderSide.SELL, new_near_sell)
                     await asyncio.sleep(self.op_spacing_sec)
-                # BUYを一番外側に追加
+
                 base_outer_buy = min(self.placed_buy_px_to_id.keys()) if self.placed_buy_px_to_id else (min(filled_buy_prices) - self.step)
                 new_outer_buy = base_outer_buy - self.step
-                logger.debug("replenish BUY: base_outer_buy={} -> new_outer_buy={}", base_outer_buy, new_outer_buy)
                 if new_outer_buy > 0 and new_outer_buy not in self.placed_buy_px_to_id:
                     await self._place_order(OrderSide.BUY, new_outer_buy)
                     await asyncio.sleep(self.op_spacing_sec)
 
-            # SELLが約定した場合:
-            #  - 反対側(BUY)の一番遠い指値(最小価格)を1つキャンセル
-            #  - BUYを一番近い側に1つ追加（現在の最高BUYよりNだけ内側=より高い価格）
-            #  - SELLを一番外側（現在の最高SELLよりNだけ外側=より高い価格）に1つ追加
             if filled_sell_prices:
-                # 反対側の一番遠いBUYをキャンセル
                 if self.placed_buy_px_to_id:
                     far_buy_px = min(self.placed_buy_px_to_id.keys())
                     far_buy_id = self.placed_buy_px_to_id.pop(far_buy_px)
                     try:
-                        await self.adapter.cancel_order(far_buy_id)
+                        await self._cancel_order_compat(far_buy_id)
                     except Exception:
                         logger.debug("cancel far BUY failed (ignore): id={} px={}", far_buy_id, far_buy_px)
                     await asyncio.sleep(self.op_spacing_sec)
-                # BUYを一番近い側に追加
+
                 base_near_buy = max(self.placed_buy_px_to_id.keys()) if self.placed_buy_px_to_id else (min(filled_sell_prices) - self.step)
                 new_near_buy = base_near_buy + self.step
-                logger.debug("replenish SELL: near_buy_base={} -> new_near_buy={} outer_sell_base(current)={}", base_near_buy, new_near_buy, max(self.placed_sell_px_to_id.keys()) if self.placed_sell_px_to_id else None)
                 if new_near_buy not in self.placed_buy_px_to_id and new_near_buy > 0:
                     await self._place_order(OrderSide.BUY, new_near_buy)
                     await asyncio.sleep(self.op_spacing_sec)
-                # SELLを一番外側に追加
+
                 base_outer_sell = max(self.placed_sell_px_to_id.keys()) if self.placed_sell_px_to_id else (max(filled_sell_prices) + self.step)
                 new_outer_sell = base_outer_sell + self.step
-                logger.debug("replenish SELL: base_outer_sell={} -> new_outer_sell={}", base_outer_sell, new_outer_sell)
                 if new_outer_sell not in self.placed_sell_px_to_id:
                     await self._place_order(OrderSide.SELL, new_outer_sell)
                     await asyncio.sleep(self.op_spacing_sec)
-        
+
         except Exception as e:
             logger.error("約定確認エラー: {}", e)
             return
 
-        # 余剰オーダーの整理（このBotが出していないOPEN注文を徐々に解消）
+        # 余剰オーダー整理
         if self.enforce_levels:
             try:
                 placed_ids = set(self.placed_buy_px_to_id.values()) | set(self.placed_sell_px_to_id.values())
-                # 抽出関数
+
                 def _oid(row: dict) -> str:
                     return str(row.get("orderId") or row.get("id") or row.get("order_id") or "")
-                # 未管理のOPEN注文
+
                 unknown = []
                 for row in (active_orders or []):
                     if not isinstance(row, dict):
@@ -954,10 +983,10 @@ class GridEngine:
                     if status and status != "OPEN":
                         continue
                     unknown.append(oid)
-                # 1ループで最大3件だけキャンセルし、徐々に整理
+
                 for oid in unknown[:3]:
                     try:
-                        await self.adapter.cancel_order(oid)
+                        await self._cancel_order_compat(oid)
                         logger.info("余剰注文をキャンセル: id={}", oid)
                     except Exception:
                         logger.debug("余剰注文キャンセル失敗(無視): id={}", oid)
@@ -969,17 +998,15 @@ class GridEngine:
         """定期的にクローズ済みPnLを取得"""
         if self.closed_poll_sec <= 0:
             return
-        
+
         now = time.time()
         if now - self._last_closed_poll_ts < self.closed_poll_sec:
             return
-        
+
         self._last_closed_poll_ts = now
-        
+
         try:
-            # ここでクローズ済みPnLを取得する処理を実装
-            # 現在は未実装のため、スキップ
+            # 未実装（将来拡張用）
             pass
         except Exception as e:
             logger.error("クローズ済みPnL取得エラー: {}", e)
-# touch test 2025-11-01T23:11:35
