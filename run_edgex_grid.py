@@ -32,7 +32,7 @@ def _mask(v: str | None) -> str:
 
 
 async def main():
-    # ---- Read ENV (strictly) ----
+    # ---- Read ENV ----
     base_url = _env("EDGEX_BASE_URL", "https://pro.edgex.exchange")
 
     contract_id_raw = _env("EDGEX_CONTRACT_ID")
@@ -48,7 +48,6 @@ async def main():
 
     dry_run = _env("DRY_RUN", "0") == "1"
 
-    # IMPORTANT: these are for auth (even if skip auth)
     account_id = _env("EDGEX_ACCOUNT_ID")
     stark_pk = _env("EDGEX_STARK_PRIVATE_KEY")
 
@@ -70,7 +69,6 @@ async def main():
         )
     )
 
-    # If either is missing, fail fast with a clear message
     if contract_id is None and symbol is None:
         raise RuntimeError(
             "ENV missing: need EDGEX_CONTRACT_ID and/or EDGEX_SYMBOL. "
@@ -82,14 +80,19 @@ async def main():
         symbol=symbol,
         base_url=base_url,
         dry_run=dry_run,
-        # auth fields (adapter側が必要なら使う)
         account_id=account_id,
         stark_private_key=stark_pk,
         skip_auth=skip_auth,
         strict_maker=strict_maker,
     )
 
-    engine = GridEngine(adapter=adapter)
+    # ✅ GridEngine は symbol 必須（あなたのログで確定）
+    # 実装差分に強くするために、2パターン試す
+    try:
+        engine = GridEngine(symbol=symbol, adapter=adapter)
+    except TypeError:
+        engine = GridEngine(adapter=adapter, symbol=symbol)
+
     await engine.run()
 
 
