@@ -12,7 +12,16 @@ from edgex_sdk import Client as EdgeXClient, OrderSide as SDKOrderSide
 import httpx  # for error detail extraction and public API calls
 
 from bot.adapters.base import ExchangeAdapter
-from bot.models.types import Balance, Order, OrderRequest, OrderSide, OrderStatus, OrderType, Ticker, TimeInForce
+from bot.models.types import (
+    Balance,
+    Order,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Ticker,
+    TimeInForce,
+)
 
 
 class EdgeXSDKAdapter(ExchangeAdapter):
@@ -25,29 +34,12 @@ class EdgeXSDKAdapter(ExchangeAdapter):
     ) -> None:
         super().__init__(name=name)
         self.base_url = base_url
-        self.account_id = account_id
+        self.account_id = int(account_id)
         self.stark_private_key = stark_private_key
-
-        self._client: EdgeXClient | None = None
-
-        # ✅ contractId（=銘柄）を環境変数で差し替える運用を想定
-        # 例: BTC 10000001 / GOLD 10000234（※IDはあなたの想定）
-        self.contract_id = os.getenv("EDGEX_CONTRACT_ID")
-
-        # Optional rounding overrides (string -> Decimal)
-        # 例: tick=0.1 step=0.01 みたいに入れると事故が減る
-        self._price_tick = self._decimal_env("EDGEX_PRICE_TICK")
-        self._size_step = self._decimal_env("EDGEX_SIZE_STEP")
-
-    def _decimal_env(self, key: str) -> Optional[Decimal]:
-        v = os.getenv(key)
-        if not v:
-            return None
-        try:
-            return Decimal(str(v))
-        except Exception:
-            logger.warning(f"invalid decimal env {key}={v}")
-            return None
+        self._client: Optional[EdgeXClient] = None
+        self._market_rules: Dict[str, Dict[str, float]] = {}
+        # (best_bid, best_ask, ts_ms)
+        self._last_depth: Dict[str, Tuple[Optional[float], Optional[float], int]] = {}
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -70,16 +62,18 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                 pass
             self._client = None
 
+    # -----------------------------
+    # Price/Ticker (SDK -> Public API fallback)
+    # -----------------------------
     async def get_ticker(self, symbol: str) -> Ticker:
         """
-        ✅ 初心者向けポイント
-        - BOT側から渡される symbol は「contractId」を想定（例: 10000001 / 10000234）
-        - まず SDK で取得を試し、ダメなら Public API (/getTicker) に自動フォールバックします
+        symbol は contractId を想定（例: 10000001 / 10000234）
+        SDKが不安定でも、Public API /getTicker に自動フォールバックして取る。
         """
         assert self._client is not None
         contract_id = str(symbol)
 
-        # --- 1) まずSDKで試す（既存の安定リトライ） ---
+        # 1) SDK try
         backoff = 0.5
         last_err: Exception | None = None
         for _ in range(6):
@@ -98,15 +92,13 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                # 429/Cloudflare/一時エラーはリトライ
                 if "429" in msg or "Too Many Requests" in msg or "cloudflare" in msg.lower() or "Just a moment" in msg:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 1.8, 8.0)
                     continue
-                # SDKが「契約IDだと取れない」系で落ちることがあるので、ここもフォールバックへ
                 break
 
-        # --- 2) SDKがダメなら Public API で取る（contractId対応） ---
+        # 2) public fallback
         try:
             price = await self._public_get_last_price(contract_id)
             return Ticker(symbol=contract_id, price=price, ts_ms=self._now_ms())
@@ -114,9 +106,6 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             raise RuntimeError(f"ticker unavailable contractId={contract_id} sdk_err={last_err} public_err={e}") from e
 
     async def _public_get_last_price(self, contract_id: str) -> float:
-        """
-        EdgeX Public API で lastPrice を取得します（SDKが不安定な時の保険）。
-        """
         base = self.base_url.rstrip("/")
         url = f"{base}/api/v1/public/quote/getTicker"
         params = {"contractId": str(contract_id)}
@@ -142,165 +131,137 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         return float(px)
 
     # -----------------------------
-    # 以下、元の実装（あなたのファイルにあるもの）を保持
-    # ※ここから下は “触らない” 方針でOK
+    # ✅ FIX: implement fetch_balances (abstract method)
     # -----------------------------
+    async def fetch_balances(self) -> List[Balance]:
+        """Fetch account balances (best-effort).
 
-    async def get_balances(self) -> List[Balance]:
-        assert self._client is not None
-        resp = await self._client.get_balance()
-        data = (resp or {}).get("data") or {}
-        res: List[Balance] = []
-        # data shape: {"collateralAsset": "...", "balance": "...", ...} or list
-        if isinstance(data, dict):
-            # try common fields
-            asset = data.get("collateralAsset") or data.get("asset") or "USDC"
-            bal = data.get("balance") or data.get("available") or data.get("equity") or "0"
-            res.append(Balance(asset=str(asset), free=float(bal), locked=0.0))
-            return res
+        This bot mainly needs the collateral balance (often USDC).
+        SDKのバージョン差を吸収しつつ、取れなければ空で返して落とさない。
+        """
+        if self._client is None:
+            return []
+        client = self._client
+
+        def _make_balance(asset: str, free: float, locked: float = 0.0) -> Balance:
+            # Balanceのフィールド名がforkで違うことがあるので順に試す
+            try:
+                return Balance(asset=asset, free=free, locked=locked)  # type: ignore
+            except Exception:
+                try:
+                    return Balance(asset=asset, available=free, locked=locked)  # type: ignore
+                except Exception:
+                    try:
+                        return Balance(symbol=asset, free=free, locked=locked)  # type: ignore
+                    except Exception:
+                        return Balance(asset, free, locked)  # type: ignore
+
+        candidates = [
+            ("get_balance", lambda: client.get_balance()),    # type: ignore[attr-defined]
+            ("get_balances", lambda: client.get_balances()),  # type: ignore[attr-defined]
+        ]
+        if hasattr(client, "account"):
+            acc = getattr(client, "account")
+            candidates += [
+                ("account.get_balance", lambda: acc.get_balance()),    # type: ignore[attr-defined]
+                ("account.get_balances", lambda: acc.get_balances()),  # type: ignore[attr-defined]
+            ]
+        if hasattr(client, "user"):
+            usr = getattr(client, "user")
+            candidates += [
+                ("user.get_balance", lambda: usr.get_balance()),       # type: ignore[attr-defined]
+                ("user.get_balances", lambda: usr.get_balances()),     # type: ignore[attr-defined]
+            ]
+
+        last_err: Exception | None = None
+        for name, fn in candidates:
+            try:
+                resp = fn()
+                if asyncio.iscoroutine(resp):
+                    resp = await resp
+
+                data = resp
+                if isinstance(resp, dict) and "data" in resp:
+                    data = resp.get("data")
+
+                balances: List[Balance] = []
+                if isinstance(data, list):
+                    for row in data:
+                        if not isinstance(row, dict):
+                            continue
+                        asset = str(row.get("asset") or row.get("collateralAsset") or row.get("symbol") or "USDC")
+                        free = row.get("available") or row.get("free") or row.get("balance") or row.get("equity") or 0
+                        locked = row.get("locked") or row.get("frozen") or row.get("hold") or 0
+                        try:
+                            balances.append(_make_balance(asset, float(free), float(locked)))
+                        except Exception:
+                            continue
+                    return balances
+
+                if isinstance(data, dict):
+                    asset = str(data.get("asset") or data.get("collateralAsset") or data.get("symbol") or "USDC")
+                    free = data.get("available") or data.get("free") or data.get("balance") or data.get("equity") or 0
+                    locked = data.get("locked") or data.get("frozen") or data.get("hold") or 0
+                    return [_make_balance(asset, float(free), float(locked))]
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        logger.warning(f"fetch_balances: could not fetch via SDK (last_err={last_err}); returning empty list")
+        return []
+
+    # -----------------------------
+    # orders (keep as-is / compatible)
+    # -----------------------------
+    async def list_active_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        if self._client is None:
+            return []
+        client = self._client
+        rows: List[Dict[str, Any]] = []
+        resp: Dict[str, Any] | None = None
+
+        if hasattr(client, "order") and hasattr(client.order, "get_active_orders"):
+            try:
+                from edgex_sdk.order.types import GetActiveOrderParams  # type: ignore
+            except Exception:
+                GetActiveOrderParams = None  # type: ignore
+            if GetActiveOrderParams is not None:
+                params_obj = GetActiveOrderParams()
+                params_obj.size = "200"
+                params_obj.filter_status_list = ["OPEN"]
+                if symbol:
+                    params_obj.contract_id_list = [str(symbol)]
+                try:
+                    resp = await client.order.get_active_orders(params_obj)  # type: ignore
+                except Exception as e:
+                    logger.debug(f"get_active_orders failed: {e}")
+                    resp = None
+
+        if resp is None and hasattr(client, "get_active_order_page"):
+            try:
+                resp = await client.get_active_order_page(  # type: ignore
+                    contract_id=str(symbol) if symbol else None,
+                    page_no=1,
+                    page_size=200,
+                )
+            except Exception as e:
+                logger.debug(f"get_active_order_page failed: {e}")
+                resp = None
+
+        data = (resp or {}).get("data") or []
+        if isinstance(data, dict) and "rows" in data:
+            data = data.get("rows") or []
+
         if isinstance(data, list):
             for row in data:
-                if not isinstance(row, dict):
-                    continue
-                asset = row.get("asset") or row.get("collateralAsset") or "USDC"
-                free = row.get("available") or row.get("free") or row.get("balance") or "0"
-                locked = row.get("locked") or row.get("frozen") or "0"
-                try:
-                    res.append(Balance(asset=str(asset), free=float(free), locked=float(locked)))
-                except Exception:
-                    continue
-        return res
+                if isinstance(row, dict):
+                    rows.append(row)
+        return rows
 
-    def _round_price(self, price: float, side: OrderSide) -> float:
-        if self._price_tick is None:
-            return float(price)
-        p = Decimal(str(price))
-        tick = self._price_tick
-        # side-aware rounding
-        if side == OrderSide.BUY:
-            q = (p / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-        else:
-            q = (p / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-        return float(q)
-
-    def _round_size(self, size: float) -> float:
-        if self._size_step is None:
-            return float(size)
-        s = Decimal(str(size))
-        step = self._size_step
-        q = (s / step).to_integral_value(rounding=ROUND_FLOOR) * step
-        return float(q)
-
-    async def place_order(self, req: OrderRequest) -> Order:
-        """
-        ✅ 重要：この adapter は req.symbol を contractId として扱います。
-        """
-        assert self._client is not None
-        contract_id = str(req.symbol)
-
-        side = SDKOrderSide.BUY if req.side == OrderSide.BUY else SDKOrderSide.SELL
-
-        price = req.price
-        size = req.size
-
-        # optional rounding
-        try:
-            price = self._round_price(float(price), req.side)
-        except Exception:
-            pass
-        try:
-            size = self._round_size(float(size))
-        except Exception:
-            pass
-
-        tif = req.tif or TimeInForce.GTC
-        order_type = req.type or OrderType.LIMIT
-
-        try:
-            resp = await self._client.place_order(
-                contract_id=contract_id,
-                side=side,
-                price=float(price),
-                size=float(size),
-                reduce_only=bool(getattr(req, "reduce_only", False)),
-                client_order_id=req.client_order_id,
-                time_in_force=str(tif),
-                order_type=str(order_type),
-            )
-            data = (resp or {}).get("data") or {}
-            oid = data.get("orderId") or data.get("id") or req.client_order_id or "unknown"
-            return Order(
-                order_id=str(oid),
-                client_order_id=req.client_order_id,
-                symbol=contract_id,
-                side=req.side,
-                type=order_type,
-                status=OrderStatus.OPEN,
-                price=float(price),
-                size=float(size),
-                filled=0.0,
-                ts_ms=self._now_ms(),
-            )
-        except httpx.HTTPStatusError as e:
-            # show more helpful detail
-            body = ""
-            try:
-                body = e.response.text
-            except Exception:
-                pass
-            logger.error(f"place_order HTTP error status={e.response.status_code} body={body}")
-            raise
-        except Exception as e:
-            logger.error(f"place_order error: {e}")
-            raise
-
-    async def cancel_order(self, symbol: str, order_id: str) -> None:
-        assert self._client is not None
-        contract_id = str(symbol)
-        await self._client.cancel_order(contract_id=contract_id, order_id=str(order_id))
-
-    async def get_open_orders(self, symbol: str) -> List[Order]:
-        assert self._client is not None
-        contract_id = str(symbol)
-        resp = await self._client.get_open_orders(contract_id)
-        data = (resp or {}).get("data") or []
-        res: List[Order] = []
-        if not isinstance(data, list):
-            return res
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            oid = row.get("orderId") or row.get("id")
-            if not oid:
-                continue
-            side = OrderSide.BUY if str(row.get("side")).upper() in ("BUY", "B", "LONG") else OrderSide.SELL
-            status = OrderStatus.OPEN
-            try:
-                price = float(row.get("price") or 0)
-                size = float(row.get("size") or row.get("quantity") or 0)
-                filled = float(row.get("filled") or row.get("filledSize") or 0)
-            except Exception:
-                price, size, filled = 0.0, 0.0, 0.0
-            res.append(
-                Order(
-                    order_id=str(oid),
-                    client_order_id=row.get("clientOrderId"),
-                    symbol=contract_id,
-                    side=side,
-                    type=OrderType.LIMIT,
-                    status=status,
-                    price=price,
-                    size=size,
-                    filled=filled,
-                    ts_ms=self._now_ms(),
-                )
-            )
-        return res
-
-    async def get_depth(self, symbol: str, limit: int = 20) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        """
-        Public API /quote/getDepth を叩いて板を取得（Cloudflare回避込み）
-        """
+    async def get_depth(
+        self, symbol: str, limit: int = 20
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         contract_id = str(symbol)
         base = self.base_url.rstrip("/")
         url = f"{base}/api/v1/public/quote/getDepth"
@@ -336,4 +297,82 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                         continue
             return out
 
-        return conv(bids), conv(asks)
+        # cache best bid/ask
+        bb = conv(bids)
+        aa = conv(asks)
+        best_bid = bb[0][0] if bb else None
+        best_ask = aa[0][0] if aa else None
+        self._last_depth[contract_id] = (best_bid, best_ask, self._now_ms())
+
+        return bb, aa
+
+    # ---- minimal wrappers expected by bot ----
+    async def place_order(self, req: OrderRequest) -> Order:
+        assert self._client is not None
+        contract_id = str(req.symbol)
+
+        side = SDKOrderSide.BUY if req.side == OrderSide.BUY else SDKOrderSide.SELL
+        price = float(req.price)
+        size = float(req.size)
+
+        tif = getattr(req, "tif", None) or TimeInForce.GTC
+        order_type = getattr(req, "type", None) or OrderType.LIMIT
+
+        resp = await self._client.place_order(
+            contract_id=contract_id,
+            side=side,
+            price=price,
+            size=size,
+            reduce_only=bool(getattr(req, "reduce_only", False)),
+            client_order_id=getattr(req, "client_order_id", None),
+            time_in_force=str(tif),
+            order_type=str(order_type),
+        )
+        data = (resp or {}).get("data") or {}
+        oid = data.get("orderId") or data.get("id") or getattr(req, "client_order_id", None) or "unknown"
+        return Order(
+            order_id=str(oid),
+            client_order_id=getattr(req, "client_order_id", None),
+            symbol=contract_id,
+            side=req.side,
+            type=order_type,
+            status=OrderStatus.OPEN,
+            price=price,
+            size=size,
+            filled=0.0,
+            ts_ms=self._now_ms(),
+        )
+
+    async def cancel_order(self, symbol: str, order_id: str) -> None:
+        assert self._client is not None
+        await self._client.cancel_order(contract_id=str(symbol), order_id=str(order_id))
+
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        rows = await self.list_active_orders(symbol=symbol)
+        res: List[Order] = []
+        for row in rows:
+            oid = row.get("orderId") or row.get("id")
+            if not oid:
+                continue
+            side = OrderSide.BUY if str(row.get("side")).upper() in ("BUY", "B", "LONG") else OrderSide.SELL
+            try:
+                price = float(row.get("price") or 0)
+                size = float(row.get("size") or row.get("quantity") or 0)
+                filled = float(row.get("filled") or row.get("filledSize") or 0)
+            except Exception:
+                price, size, filled = 0.0, 0.0, 0.0
+            res.append(
+                Order(
+                    order_id=str(oid),
+                    client_order_id=row.get("clientOrderId"),
+                    symbol=str(symbol),
+                    side=side,
+                    type=OrderType.LIMIT,
+                    status=OrderStatus.OPEN,
+                    price=price,
+                    size=size,
+                    filled=filled,
+                    ts_ms=self._now_ms(),
+                )
+            )
+        return res
