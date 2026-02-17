@@ -1,9 +1,21 @@
-import os
-import asyncio
-import logging
+"""
+run_edgex_grid.py
 
-from bot.grid_engine import GridEngine
+Repository root runner for GridEngine + EdgeXSDKAdapter.
+
+- Reads env
+- Initializes adapter (symbol/contract_id both supported)
+- Starts GridEngine
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from loguru import logger
+
 from bot.adapters.edgex_sdk import EdgeXSDKAdapter
+from bot.grid_engine import GridEngine
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -13,91 +25,61 @@ def _env(name: str, default: str | None = None) -> str | None:
     return v
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(name: str, default: int | None = None) -> int | None:
-    v = _env(name)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
-
-
-def _mask(s: str | None, keep: int = 3) -> str:
-    if not s:
-        return "None"
-    if len(s) <= keep * 2:
-        return "*" * len(s)
-    return f"{s[:keep]}***{s[-keep:]}"
-
-
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s",
-    )
-    log = logging.getLogger("__main__")
-
+async def main() -> None:
+    # Core env
     base_url = _env("EDGEX_BASE_URL", "https://pro.edgex.exchange")
-    contract_id = _env_int("EDGEX_CONTRACT_ID")
-    symbol = _env("EDGEX_SYMBOL")  # <-- これを GridEngine に必ず渡す
-    dry_run = _env_bool("DRY_RUN", False)
+    contract_id = _env("EDGEX_CONTRACT_ID", None)
+    symbol = _env("EDGEX_SYMBOL", None) or _env("SYMBOL", None)  # optional fallback
 
-    strict_maker = _env_bool("EDGEX_STRICT_MAKER", True)
+    dry_run = _truthy(_env("DRY_RUN", "0")) or _truthy(_env("EDGEX_DRY_RUN", "0"))
 
-    # ✅ whitelist済みのものを入れる前提
-    account_id = _env("EDGEX_ACCOUNT_ID")
-    stark_private_key = _env("EDGEX_STARK_PRIVATE_KEY")
+    # Grid loop interval (GridEngine internally clamps to >= 1.5 sec)
+    poll_sec_raw = _env("EDGEX_POLL_INTERVAL_SEC", _env("POLL_INTERVAL_SEC", "2.0"))
+    try:
+        poll_interval_sec = float(poll_sec_raw or "2.0")
+    except Exception:
+        poll_interval_sec = 2.0
 
-    # 重要：今回は「認証突破できる」前提なのでスキップは使わない
-    skip_auth = _env_bool("EDGEX_SKIP_AUTH", False)
-    if skip_auth:
-        log.warning("EDGEX_SKIP_AUTH=1 は今回の前提と逆なので、0/削除を推奨します（動作が分岐します）")
+    # Choose a "symbol-like" value for GridEngine:
+    # - Prefer EDGEX_SYMBOL if present
+    # - else use contract_id
+    # GridEngine passes this into adapter.get_ticker/list_active_orders,
+    # and adapter resolves both symbol/contract_id anyway.
+    engine_symbol = symbol or contract_id
+    if not engine_symbol:
+        raise RuntimeError("Missing EDGEX_SYMBOL and EDGEX_CONTRACT_ID. Set at least one.")
 
-    log.info(
-        "[BOOT] base_url=%s contract_id=%s symbol=%s dry_run=%s strict_maker=%s account_id=%s stark_pk=%s",
+    logger.info(
+        "runner env: base_url={} symbol={} contract_id={} dry_run={} poll_interval_sec={}",
         base_url,
-        contract_id,
         symbol,
+        contract_id,
         dry_run,
-        strict_maker,
-        _mask(account_id),
-        _mask(stark_private_key),
+        poll_interval_sec,
     )
-
-    if contract_id is None:
-        raise RuntimeError("EDGEX_CONTRACT_ID is required")
-    if not symbol:
-        raise RuntimeError("EDGEX_SYMBOL is required (e.g. XAUT-USD)")
-    if not dry_run:
-        # dry_runでないなら認証情報必須
-        if not account_id:
-            raise RuntimeError("EDGEX_ACCOUNT_ID is required for non-dry-run")
-        if not stark_private_key:
-            raise RuntimeError("EDGEX_STARK_PRIVATE_KEY is required for non-dry-run")
 
     adapter = EdgeXSDKAdapter(
         base_url=base_url,
         contract_id=contract_id,
         symbol=symbol,
         dry_run=dry_run,
-        strict_maker=strict_maker,
-        account_id=account_id,
-        stark_private_key=stark_private_key,
     )
 
-    # ✅ ここが今回のキモ：GridEngineに symbol を必ず渡す（missing symbol の根本対応）
-    engine = GridEngine(adapter=adapter, symbol=symbol)
+    engine = GridEngine(
+        adapter=adapter,
+        symbol=engine_symbol,
+        poll_interval_sec=poll_interval_sec,
+    )
 
     await engine.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user (Ctrl+C).")
